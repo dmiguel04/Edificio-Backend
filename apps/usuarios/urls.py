@@ -2,7 +2,8 @@ from django.urls import path
 from .views import (
     RegisterAPIView, LoginAPIView, CheckPersonaAPIView,
     ForgotPasswordAPIView, ResetPasswordAPIView, ChangePasswordAPIView, ValidateLoginTokenAPIView, AuditoriaEventoListAPIView,
-    LogoutAPIView, Activate2FAAPIView, Verify2FAAPIView, UsuarioRawAPIView
+    LogoutAPIView, Activate2FAAPIView, Verify2FAAPIView, UsuarioRawAPIView,
+    AccountStatusAPIView 
 )
 
 urlpatterns = [
@@ -18,4 +19,5 @@ urlpatterns = [
     path('2fa/activate/', Activate2FAAPIView.as_view(), name='activate-2fa'),
     path('2fa/verify/', Verify2FAAPIView.as_view(), name='verify-2fa'),
     path('raw/', UsuarioRawAPIView.as_view(), name='usuario-raw'),  # <-- CORRECTO
+    path('account-status/', AccountStatusAPIView.as_view(), name='account-status'),
 ]
