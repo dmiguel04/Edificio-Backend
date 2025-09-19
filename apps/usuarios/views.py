@@ -336,8 +336,13 @@ class AccountStatusAPIView(APIView):
             return Response({"error": "Username requerido"}, status=400)
         try:
             usuario = Usuario.objects.get(username=username)
+            # Convertir a hora local si existe bloqueo
+            account_locked_until = usuario.account_locked_until
+            if account_locked_until:
+                account_locked_until = timezone.localtime(account_locked_until)
+                account_locked_until = account_locked_until.strftime('%Y-%m-%d %H:%M:%S')
             return Response({
-                "account_locked_until": usuario.account_locked_until,
+                "account_locked_until": account_locked_until,
                 "failed_login_attempts": usuario.failed_login_attempts
             })
         except Usuario.DoesNotExist:
