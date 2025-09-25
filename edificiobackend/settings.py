@@ -82,6 +82,7 @@ WSGI_APPLICATION = 'edificiobackend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+# Configuración para PostgreSQL (producción)
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
@@ -158,13 +159,17 @@ CORS_ALLOWED_ORIGINS = [
 ]
 
 # Configuración de correo para envío de emails de verificación y recuperación
+# Para desarrollo - mostrar emails en consola (comentado temporalmente)
+# EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+
+# Para producción - envío real por SMTP
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'smtp.gmail.com'  # Cambia por el servidor SMTP de tu proveedor (ejemplo: Gmail)
 EMAIL_PORT = 587
 EMAIL_HOST_USER = 'davidmachicado919@gmail.com'  # Aquí va TU correo (el que enviará los mensajes)
 EMAIL_HOST_PASSWORD = 'mzammldbfmxqsvtv'  # Contraseña de aplicación (generada por google) o del correo
 EMAIL_USE_TLS = True
-DEFAULT_FROM_EMAIL = 'noreply@tudominio.com'  # El remitente que verán los usuarios en su bandeja
+DEFAULT_FROM_EMAIL = 'noreply@edificioapp.com'  # El remitente que verán los usuarios en su bandeja
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),  # Token expira en 15 minutos
@@ -181,3 +186,10 @@ SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = 'DENY'
 CSRF_COOKIE_SECURE = True
 SESSION_COOKIE_SECURE = True
+
+# Django usa esto por defecto para hashear contraseñas
+PASSWORD_HASHERS = [
+    'django.contrib.auth.hashers.PBKDF2PasswordHasher',     # PBKDF2-SHA256
+    'django.contrib.auth.hashers.PBKDF2SHA1PasswordHasher', # PBKDF2-SHA1  
+    'django.contrib.auth.hashers.ScryptPasswordHasher',     # Scrypt
+]

@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import Persona, Usuario
 from .models import AuditoriaEvento
-from .crypto import encrypt_password, decrypt_password
+from .crypto import encrypt_sensitive_data, decrypt_sensitive_data  # Solo para datos sensibles
 import re
 import bleach  # <-- Importa bleach para limpiar HTML
 
@@ -75,17 +75,75 @@ class RegisterSerializer(serializers.Serializer):
         return data
 
     def create(self, validated_data):
+        from django.utils import timezone
+        from datetime import timedelta
+        import random
+        from django.core.mail import send_mail
+        from django.conf import settings
+        
         persona_data = validated_data.pop("persona")
         persona = Persona.objects.create(**persona_data)
-        encrypted_password = encrypt_password(validated_data["password"])
-        usuario = Usuario.objects.create(
+        
+        # Generar código de verificación numérico de 6 dígitos
+        verification_token = str(random.randint(100000, 999999))
+        expires_at = timezone.now() + timedelta(hours=24)  # Expira en 24 horas
+        
+        # Crear usuario usando el sistema de hash seguro
+        usuario = Usuario.objects.create_user(
             username=validated_data["username"],
             email=persona.email,
-            password_encrypted=encrypted_password,
+            password=validated_data["password"],  # Se hashea automáticamente
             persona=persona,
-            is_email_verified=True,
+            is_email_verified=False,  # Cambiar a False hasta verificar
+            email_verification_token=verification_token,
+            email_verification_expires=expires_at,
         )
+        
+        # Enviar correo de verificación
+        self._send_verification_email(usuario)
+        
         return usuario
+    
+    def _send_verification_email(self, usuario):
+        """Envía correo de verificación al usuario"""
+        from django.core.mail import send_mail
+        from django.conf import settings
+        
+        subject = "Código de verificación - EdificioApp"
+        
+        message = f"""
+        ¡Hola {usuario.persona.nombre}!
+        
+        Gracias por registrarte en EdificioApp. Para completar tu registro, por favor ingresa el siguiente código de verificación en la aplicación:
+        
+        CÓDIGO DE VERIFICACIÓN: {usuario.email_verification_token}
+        
+        Este código expirará en 24 horas.
+        
+        Si no creaste esta cuenta, puedes ignorar este correo.
+        
+        Saludos,
+        El equipo de EdificioApp
+        """
+        
+        try:
+            print(f"🔄 Intentando enviar correo a: {usuario.email}")
+            print(f"📧 Código de verificación: {usuario.email_verification_token}")
+            
+            send_mail(
+                subject,
+                message,
+                settings.DEFAULT_FROM_EMAIL,  # Usar DEFAULT_FROM_EMAIL que sí está definido
+                [usuario.email],
+                fail_silently=False,
+            )
+            print(f"✅ Correo enviado exitosamente a: {usuario.email}")
+        except Exception as e:
+            print(f"❌ ERROR enviando correo de verificación: {e}")
+            print(f"📧 Email Backend: {settings.EMAIL_BACKEND}")
+            print(f"📧 From Email: {settings.DEFAULT_FROM_EMAIL}")
+            # Re-raise para que se vea el error completo
+            raise e
 
 class LoginSerializer(serializers.Serializer):
     username = serializers.CharField()
@@ -100,9 +158,20 @@ class LoginSerializer(serializers.Serializer):
         except Usuario.DoesNotExist:
             raise serializers.ValidationError("Usuario no encontrado")
 
-        decrypted_pass = decrypt_password(usuario.password_encrypted)
-        if decrypted_pass != password:
+        # Verificar contraseña
+        if not usuario.check_password(password):
             raise serializers.ValidationError("Contraseña incorrecta")
+
+        # NUEVA VALIDACIÓN: Verificar que el email esté verificado
+        if not usuario.is_email_verified:
+            raise serializers.ValidationError({
+                "email_not_verified": True,
+                "message": "Debes verificar tu correo electrónico antes de iniciar sesión",
+                "email": usuario.email,
+                "action": "Revisa tu bandeja de entrada o solicita un nuevo correo de verificación",
+                "verification_endpoint": "/api/usuarios/verificar-email/",
+                "resend_endpoint": "/api/usuarios/reenviar-verificacion/"
+            })
 
         data["usuario"] = usuario
         return data

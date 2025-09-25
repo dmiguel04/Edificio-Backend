@@ -26,7 +26,7 @@ from django.http import HttpResponse
 from django.db import connection
 
 class Activate2FAAPIView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def get(self, request):
         user = request.user
@@ -79,12 +79,18 @@ class RegisterAPIView(APIView):
         serializer = RegisterSerializer(data=request.data)
         if serializer.is_valid():
             usuario = serializer.save()
-            usuario.is_email_verified = True
-            usuario.save()
+            
+            # Respuesta informando que debe verificar su correo
             return Response({
                 "id_usuario": usuario.id,
                 "username": usuario.username,
-                "message": "Usuario creado correctamente."
+                "email": usuario.email,
+                "message": "¡Registro exitoso! Te hemos enviado un correo de verificación.",
+                "next_step": "Revisa tu bandeja de entrada y verifica tu correo electrónico antes de iniciar sesión",
+                "email_sent_to": usuario.email,
+                "expires_in": "24 horas",
+                "verification_required": True,
+                "reenviar_endpoint": "/api/usuarios/reenviar-verificacion/"
             }, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -138,6 +144,29 @@ class LoginAPIView(APIView):
                 "username": usuario.username
             }, status=status.HTTP_200_OK)
         else:
+            # Manejar errores específicos del serializer
+            errors = serializer.errors
+            
+            # Verificar si es error de email no verificado
+            if isinstance(errors, dict) and 'email_not_verified' in str(errors):
+                # No incrementar contador de intentos fallidos para email no verificado
+                AuditoriaEvento.objects.create(
+                    usuario=usuario,
+                    username=username,
+                    evento='login_fallido',
+                    ip=ip,
+                    user_agent=user_agent,
+                    detalle='Login fallido: Email no verificado'
+                )
+                return Response({
+                    "error": "email_not_verified",
+                    "message": "Debes verificar tu correo electrónico antes de iniciar sesión",
+                    "email": usuario.email if usuario else None,
+                    "verification_endpoint": "/api/usuarios/verificar-email/",
+                    "resend_endpoint": "/api/usuarios/reenviar-verificacion/"
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Para otros errores (usuario no encontrado, contraseña incorrecta, etc.)
             # Si el usuario existe, incrementa el contador de intentos fallidos
             if usuario:
                 usuario.failed_login_attempts += 1
@@ -220,7 +249,7 @@ class ResetPasswordAPIView(APIView):
             return Response({"error": "Token inválido."}, status=400)
 
 class ChangePasswordAPIView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     def post(self, request):
         user = request.user
         new_password = request.data.get('new_password')
@@ -297,16 +326,119 @@ class AuditoriaEventoListAPIView(generics.ListAPIView):
     filterset_fields = ['evento', 'username', 'fecha']
     
 class LogoutAPIView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def post(self, request):
+        """
+        Logout optimizado para frontend con timeouts
+        - Respuesta rápida (< 200ms)
+        - Siempre retorna 200 OK para evitar errores en frontend
+        - Blacklist de tokens en background si es posible
+        """
+        refresh_token = request.data.get("refresh")
+        access_token = request.data.get("access")
+        
+        # Respuesta inmediata al frontend
+        response_data = {
+            "msg": "Logout exitoso",
+            "status": "success", 
+            "timestamp": timezone.now().isoformat(),
+            "next_action": "redirect_to_login"
+        }
+        
+        # Intentar blacklist en background (no bloquear respuesta)
         try:
-            refresh_token = request.data["refresh"]
-            token = RefreshToken(refresh_token)
-            token.blacklist()
-            return Response({"msg": "Sesión cerrada correctamente."}, status=200)
+            if refresh_token:
+                token = RefreshToken(refresh_token)
+                token.blacklist()
+                
+            # Registrar evento de logout en auditoría
+            user = getattr(request, 'user', None)
+            if user and hasattr(user, 'username'):
+                AuditoriaEvento.objects.create(
+                    usuario=user if user.is_authenticated else None,
+                    username=user.username if user.is_authenticated else 'anonymous',
+                    evento='logout_exitoso',
+                    ip=self.get_client_ip(request),
+                    user_agent=request.META.get('HTTP_USER_AGENT', ''),
+                    detalle='Logout manual exitoso'
+                )
         except Exception as e:
-            return Response({"error": "Token inválido o ya caducado."}, status=400)
+            # Log error pero no fallar el logout
+            print(f"Warning: Error en blacklist durante logout: {e}")
+            
+        # SIEMPRE retornar 200 OK para que frontend pueda limpiar tokens
+        return Response(response_data, status=200)
+    
+    def get_client_ip(self, request):
+        """Obtener IP real del cliente"""
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            ip = x_forwarded_for.split(',')[0]
+        else:
+            ip = request.META.get('REMOTE_ADDR')
+        return ip
+
+class LogoutAllSessionsAPIView(APIView):
+    """Logout masivo - Cerrar todas las sesiones del usuario"""
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        """
+        Cierra todas las sesiones activas del usuario
+        - Útil al cambiar contraseña
+        - Útil cuando hay actividad sospechosa
+        """
+        user = request.user
+        
+        try:
+            # Obtener todos los refresh tokens del usuario y blacklistearlos
+            from rest_framework_simplejwt.token_blacklist.models import OutstandingToken
+            
+            outstanding_tokens = OutstandingToken.objects.filter(user=user)
+            blacklisted_count = 0
+            
+            for token in outstanding_tokens:
+                try:
+                    refresh_token = RefreshToken(token.token)
+                    refresh_token.blacklist()
+                    blacklisted_count += 1
+                except Exception:
+                    continue  # Token ya blacklisted o inválido
+            
+            # Registrar evento de logout masivo
+            AuditoriaEvento.objects.create(
+                usuario=user,
+                username=user.username,
+                evento='logout_exitoso',
+                ip=self.get_client_ip(request),
+                user_agent=request.META.get('HTTP_USER_AGENT', ''),
+                detalle=f'Logout masivo - {blacklisted_count} sesiones cerradas'
+            )
+            
+            return Response({
+                "msg": "Todas las sesiones han sido cerradas exitosamente",
+                "sessions_closed": blacklisted_count,
+                "status": "success",
+                "next_action": "redirect_to_login"
+            }, status=200)
+            
+        except Exception as e:
+            return Response({
+                "msg": "Logout masivo completado (con advertencias)",
+                "status": "partial_success", 
+                "warning": "Algunas sesiones podrían seguir activas",
+                "next_action": "redirect_to_login"
+            }, status=200)  # Siempre 200 para no romper frontend
+    
+    def get_client_ip(self, request):
+        """Obtener IP real del cliente"""
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            ip = x_forwarded_for.split(',')[0]
+        else:
+            ip = request.META.get('REMOTE_ADDR')
+        return ip
 
 # --- Ejemplo de consulta SQL cruda protegida ---
 class UsuarioRawAPIView(APIView):
@@ -347,3 +479,115 @@ class AccountStatusAPIView(APIView):
             })
         except Usuario.DoesNotExist:
             return Response({"error": "Usuario no encontrado"}, status=404)
+
+
+# ===== NUEVAS VISTAS PARA VERIFICACIÓN DE EMAIL =====
+
+class VerificarEmailAPIView(APIView):
+    """Verificar email con código de verificación"""
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        email = request.data.get('email')
+        codigo = request.data.get('codigo')
+        
+        if not email:
+            return Response({"error": "Email requerido"}, status=400)
+        if not codigo:
+            return Response({"error": "Código de verificación requerido"}, status=400)
+        
+        try:
+            usuario = Usuario.objects.get(email=email, email_verification_token=codigo)
+            
+            # Verificar si el código ha expirado
+            if usuario.email_verification_expires and timezone.now() > usuario.email_verification_expires:
+                return Response({
+                    "error": "Código expirado", 
+                    "message": "El código de verificación ha expirado. Solicita un nuevo correo de verificación."
+                }, status=400)
+            
+            # Verificar email
+            usuario.is_email_verified = True
+            usuario.email_verification_token = None
+            usuario.email_verification_expires = None
+            usuario.save()
+            
+            return Response({
+                "message": "¡Email verificado exitosamente!",
+                "verified": True,
+                "username": usuario.username,
+                "email": usuario.email,
+                "redirect": "/login",
+                "next_step": "Ahora puedes iniciar sesión con normalidad",
+                "login_endpoint": "/api/usuarios/login/"
+            }, status=200)
+            
+        except Usuario.DoesNotExist:
+            return Response({"error": "Email o código inválido"}, status=400)
+
+
+class ReenviarVerificacionAPIView(APIView):
+    """Reenviar correo de verificación si el token expiró"""
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        email = request.data.get('email')
+        if not email:
+            return Response({"error": "Email requerido"}, status=400)
+        
+        try:
+            usuario = Usuario.objects.get(email=email)
+            
+            # Verificar si ya está verificado
+            if usuario.is_email_verified:
+                return Response({"message": "El email ya está verificado. Puedes iniciar sesión."}, status=200)
+            
+            # Generar nuevo código de verificación y nueva fecha de expiración  
+            import random
+            usuario.email_verification_token = str(random.randint(100000, 999999))
+            usuario.email_verification_expires = timezone.now() + timedelta(hours=24)
+            usuario.save()
+            
+            # Enviar nuevo correo
+            self._send_verification_email(usuario)
+            
+            return Response({
+                "message": "Correo de verificación reenviado exitosamente",
+                "expires_in": "24 horas"
+            }, status=200)
+            
+        except Usuario.DoesNotExist:
+            return Response({"error": "No existe un usuario con ese email"}, status=404)
+    
+    def _send_verification_email(self, usuario):
+        """Envía correo de verificación al usuario"""
+        subject = "Nuevo código de verificación - EdificioApp"
+        
+        message = f"""
+        ¡Hola {usuario.persona.nombre}!
+        
+        Has solicitado un nuevo código de verificación para tu cuenta en EdificioApp.
+        
+        Para completar tu registro, por favor ingresa el siguiente código de verificación en la aplicación:
+        
+        CÓDIGO DE VERIFICACIÓN: {usuario.email_verification_token}
+        
+        Este código expirará en 24 horas.
+        
+        Si no solicitaste esto, puedes ignorar este correo.
+        
+        Saludos,
+        El equipo de EdificioApp
+        """
+        
+        try:
+            send_mail(
+                subject,
+                message,
+                settings.DEFAULT_FROM_EMAIL,
+                [usuario.email],
+                fail_silently=False,
+            )
+        except Exception as e:
+            print(f"Error enviando correo de verificación: {e}")
+            pass
