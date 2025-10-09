@@ -1,9 +1,9 @@
 from rest_framework import serializers
-from .models import Persona, Usuario
-from .models import AuditoriaEvento
+from .models import Persona, Usuario, AuditoriaEvento
 from .crypto import encrypt_sensitive_data, decrypt_sensitive_data  # Solo para datos sensibles
 import re
-import bleach  # <-- Importa bleach para limpiar HTML
+import bleach
+from django.db import transaction
 
 COMMON_PASSWORDS = [
     "123456", "password", "12345678", "qwerty", "abc123", "111111", "123456789", "12345", "123123", "admin"
@@ -37,7 +37,6 @@ class RegisterSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True)
 
     def validate_password(self, value):
-        # Validación básica
         if len(value) < 8:
             raise serializers.ValidationError("La contraseña debe tener al menos 8 caracteres.")
         if not re.search(r"[A-Z]", value):
@@ -63,7 +62,6 @@ class RegisterSerializer(serializers.Serializer):
         if Usuario.objects.filter(username=data['username']).exists():
             raise serializers.ValidationError({'username': 'Ya existe un usuario con este username.'})
 
-        # Prevención de contraseñas que incluyan nombre, apellido, ci o fecha de nacimiento
         if (
             nombre.lower() in password.lower() or
             apellido.lower() in password.lower() or
@@ -80,30 +78,31 @@ class RegisterSerializer(serializers.Serializer):
         import random
         from django.core.mail import send_mail
         from django.conf import settings
-        
+
         persona_data = validated_data.pop("persona")
-        persona = Persona.objects.create(**persona_data)
-        
-        # Generar código de verificación numérico de 6 dígitos
+
         verification_token = str(random.randint(100000, 999999))
-        expires_at = timezone.now() + timedelta(hours=24)  # Expira en 24 horas
-        
-        # Crear usuario usando el sistema de hash seguro
-        usuario = Usuario.objects.create_user(
-            username=validated_data["username"],
-            email=persona.email,
-            password=validated_data["password"],  # Se hashea automáticamente
-            persona=persona,
-            is_email_verified=False,  # Cambiar a False hasta verificar
-            email_verification_token=verification_token,
-            email_verification_expires=expires_at,
-        )
-        
-        # Enviar correo de verificación
+        expires_at = timezone.now() + timedelta(hours=24)
+
+        with transaction.atomic():
+            # Crear persona
+            persona = Persona.objects.create(**persona_data)
+
+            # Crear usuario vinculado a la persona
+            usuario = Usuario.objects.create_user(
+                username=validated_data["username"],
+                email=persona.email,
+                password=validated_data["password"],
+                persona=persona,
+                is_email_verified=False,
+                email_verification_token=verification_token,
+                email_verification_expires=expires_at,
+            )
+
+        # Enviar correo fuera de la transacción
         self._send_verification_email(usuario)
-        
+
         return usuario
-    
     def _send_verification_email(self, usuario):
         """Envía correo de verificación al usuario"""
         from django.core.mail import send_mail
@@ -145,6 +144,7 @@ class RegisterSerializer(serializers.Serializer):
             # Re-raise para que se vea el error completo
             raise e
 
+    
 class LoginSerializer(serializers.Serializer):
     username = serializers.CharField()
     password = serializers.CharField(write_only=True)
@@ -158,11 +158,9 @@ class LoginSerializer(serializers.Serializer):
         except Usuario.DoesNotExist:
             raise serializers.ValidationError("Usuario no encontrado")
 
-        # Verificar contraseña
         if not usuario.check_password(password):
             raise serializers.ValidationError("Contraseña incorrecta")
 
-        # NUEVA VALIDACIÓN: Verificar que el email esté verificado
         if not usuario.is_email_verified:
             raise serializers.ValidationError({
                 "email_not_verified": True,
@@ -177,7 +175,6 @@ class LoginSerializer(serializers.Serializer):
         return data
 
 class AuditoriaEventoSerializer(serializers.ModelSerializer):
-    # Ejemplo: Si tienes un campo descripcion que puede contener HTML, límpialo aquí
     def validate_descripcion(self, value):
         return bleach.clean(value)
 

@@ -166,8 +166,8 @@ CORS_ALLOWED_ORIGINS = [
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'smtp.gmail.com'  # Cambia por el servidor SMTP de tu proveedor (ejemplo: Gmail)
 EMAIL_PORT = 587
-EMAIL_HOST_USER = 'davidmachicado919@gmail.com'  # Aquí va TU correo (el que enviará los mensajes)
-EMAIL_HOST_PASSWORD = 'mzammldbfmxqsvtv'  # Contraseña de aplicación (generada por google) o del correo
+EMAIL_HOST_USER = 'innovabuilding01@gmail.com'  # Aquí va TU correo (el que enviará los mensajes)
+EMAIL_HOST_PASSWORD = 'tlfv jnlw fyax llmu'  # Contraseña de aplicación (generada por google) o del correo
 EMAIL_USE_TLS = True
 DEFAULT_FROM_EMAIL = 'noreply@edificioapp.com'  # El remitente que verán los usuarios en su bandeja
 

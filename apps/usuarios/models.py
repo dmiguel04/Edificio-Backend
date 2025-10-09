@@ -5,6 +5,7 @@ from apps.usuarios.crypto import encrypt_sensitive_data, decrypt_sensitive_data
 from django.utils import timezone
 import base64
 
+
 class Persona(models.Model):
     id_persona = models.AutoField(primary_key=True)
     nombre = models.CharField(max_length=50)
@@ -17,6 +18,7 @@ class Persona(models.Model):
 
     def __str__(self):
         return f"{self.nombre} {self.apellido}"
+
 
 class UsuarioManager(BaseUserManager):
     def create_user(self, username, email, password=None, **extra_fields):
@@ -35,15 +37,18 @@ class UsuarioManager(BaseUserManager):
         extra_fields.setdefault('is_superuser', True)
         return self.create_user(username, email, password, **extra_fields)
 
+
 class Usuario(AbstractBaseUser, PermissionsMixin):
-    id = models.AutoField(primary_key=True)  # Cambiado de id_usuario a id
+    id = models.AutoField(primary_key=True)
     username = models.CharField(max_length=150, unique=True)
     persona = models.OneToOneField(Persona, on_delete=models.CASCADE, related_name="usuario")
     email = models.EmailField(unique=True)
-    password = models.CharField(max_length=128)  # Campo estándar de Django para hash
+    password = models.CharField(max_length=128)  # hash de contraseña
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
-    # --- Nuevos campos para verificación, recuperación y login token ---
+    # 🔹 Nuevo campo obligatorio para no romper integridad
+    date_joined = models.DateTimeField(default=timezone.now)
+    # --- Campos de verificación y seguridad ---
     is_email_verified = models.BooleanField(default=False)
     email_verification_token = models.CharField(max_length=64, null=True, blank=True)
     email_verification_expires = models.DateTimeField(null=True, blank=True)
@@ -72,6 +77,7 @@ class Usuario(AbstractBaseUser, PermissionsMixin):
     def __str__(self):
         return self.username
 
+
 class Biometricos(models.Model):
     id_biometrico = models.AutoField(primary_key=True)
     huellas_encrypted = models.TextField(null=True, blank=True)
@@ -88,8 +94,8 @@ class Biometricos(models.Model):
             return b""
         b64 = decrypt_sensitive_data(self.huellas_encrypted)
         return base64.b64decode(b64)
+    # Métodos similares para rostro e iris si los necesitas
 
-    # Puedes agregar métodos similares para rostro e iris
 
 class Pago(models.Model):
     id_pago = models.AutoField(primary_key=True)
@@ -106,6 +112,7 @@ class Pago(models.Model):
         if not self.referencia_bancaria_encrypted:
             return ""
         return decrypt_sensitive_data(self.referencia_bancaria_encrypted)
+
 
 class AuditoriaEvento(models.Model):
     EVENTO_CHOICES = [
