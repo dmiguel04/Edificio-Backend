@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     "rest_framework_simplejwt",
     'rest_framework_simplejwt.token_blacklist',
     "corsheaders",  # opcional para frontend
+    'apps.gestion_usuarios',
 ]
 
 MIDDLEWARE = [
@@ -193,3 +194,7 @@ PASSWORD_HASHERS = [
     'django.contrib.auth.hashers.PBKDF2SHA1PasswordHasher', # PBKDF2-SHA1  
     'django.contrib.auth.hashers.ScryptPasswordHasher',     # Scrypt
 ]
+
+# Valor por defecto para el rol asignado a nuevos registros de usuario.
+# Debe coincidir con una de las opciones de `Role.choices` (ej. 'residente', 'personal', 'junta', 'admin')
+DEFAULT_REGISTER_ROLE = 'residente'

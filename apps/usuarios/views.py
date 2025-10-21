@@ -2,9 +2,13 @@ from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.contrib.auth import authenticate
-from .serializers import RegisterSerializer, LoginSerializer, AuditoriaEventoSerializer, validar_password
-from .models import Usuario, Persona
-from .models import AuditoriaEvento
+from .serializers import (
+    RegisterSerializer,
+    LoginSerializer,
+    AuditoriaEventoSerializer,
+    validar_password,
+)
+from .models import Usuario, Persona, AuditoriaEvento
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.core.mail import send_mail
 from django.conf import settings
@@ -16,36 +20,57 @@ from django.utils import timezone
 from datetime import timedelta
 import base64
 
-# --- 2FA imports ---
+# 2FA / QR
 import pyotp
 import qrcode
 import io
 from django.http import HttpResponse
 
-# --- SQL crudo seguro ---
+# SQL crudo seguro
 from django.db import connection
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def get_client_ip(request):
+    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded_for:
+        return x_forwarded_for.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR')
+
+
+def send_email(subject: str, message: str, recipient_list: list, fail_silently: bool = True):
+    """Wrapper around Django send_mail with error logging."""
+    try:
+        send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, recipient_list, fail_silently=fail_silently)
+    except Exception as e:
+        logger.exception("Error sending email to %s: %s", recipient_list, e)
+
 class Activate2FAAPIView(APIView):
-    permission_classes = [AllowAny]
+    """Genera/retorna el QR/base64 para activar 2FA. Requiere autenticación.
+
+    Retorna JSON con `qr_url` (data URL base64 PNG) para que el frontend lo muestre.
+    """
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
         user = request.user
         if not user.two_factor_secret:
-            secret = pyotp.random_base32()
-            user.two_factor_secret = secret
+            user.two_factor_secret = pyotp.random_base32()
             user.save()
-        else:
-            secret = user.two_factor_secret
 
-        otp_uri = pyotp.totp.TOTP(secret).provisioning_uri(
+        otp_uri = pyotp.totp.TOTP(user.two_factor_secret).provisioning_uri(
             name=user.email,
-            issuer_name="EdificioApp"
+            issuer_name="EdificioApp",
         )
         img = qrcode.make(otp_uri)
         buf = io.BytesIO()
-        img.save(buf)
-        buf.seek(0)
-        return HttpResponse(buf, content_type='image/png')
+        img.save(buf, format='PNG')
+        img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        qr_url = f"data:image/png;base64,{img_base64}"
+        return Response({"qr_url": qr_url})
 
 class Verify2FAAPIView(APIView):
     permission_classes = [AllowAny]
@@ -67,122 +92,129 @@ class Verify2FAAPIView(APIView):
                 return Response({
                     "msg": "2FA verificado correctamente.",
                     "access": str(refresh.access_token),
-                    "refresh": str(refresh)
+                    "refresh": str(refresh),
                 })
-            else:
-                return Response({"error": "Código inválido."}, status=400)
+            return Response({"error": "Código inválido."}, status=400)
         except Usuario.DoesNotExist:
             return Response({"error": "Usuario no encontrado."}, status=400)
 
 class RegisterAPIView(APIView):
+    permission_classes = [AllowAny]
+
     def post(self, request):
         serializer = RegisterSerializer(data=request.data)
         if serializer.is_valid():
             usuario = serializer.save()
-            
-            # Respuesta informando que debe verificar su correo
-            return Response({
-                "id_usuario": usuario.id,
-                "username": usuario.username,
-                "email": usuario.email,
-                "message": "¡Registro exitoso! Te hemos enviado un correo de verificación.",
-                "next_step": "Revisa tu bandeja de entrada y verifica tu correo electrónico antes de iniciar sesión",
-                "email_sent_to": usuario.email,
-                "expires_in": "24 horas",
-                "verification_required": True,
-                "reenviar_endpoint": "/api/usuarios/reenviar-verificacion/"
-            }, status=status.HTTP_201_CREATED)
+
+            # Enviar correo de verificación asíncrono (wrapper)
+            try:
+                send_email(
+                    subject="Verifica tu cuenta - EdificioApp",
+                    message=f"Tu código de verificación es: {usuario.email_verification_token}",
+                    recipient_list=[usuario.email],
+                )
+            except Exception:
+                # No fallamos la creación si el envío de correo falló
+                logger.warning("Fallo al enviar correo de verificación para %s", usuario.email)
+
+            return Response(
+                {
+                    "id_usuario": usuario.id,
+                    "username": usuario.username,
+                    "email": usuario.email,
+                    "message": "¡Registro exitoso! Revisa tu correo para verificar tu cuenta.",
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 # Eliminada la clase VerifyEmailAPIView
 
 class LoginAPIView(APIView):
+    permission_classes = [AllowAny]
+
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
         username = request.data.get('username', '')
-        ip = request.META.get('REMOTE_ADDR')
+        ip = get_client_ip(request)
         user_agent = request.META.get('HTTP_USER_AGENT', '')
 
         usuario = Usuario.objects.filter(username=username).first()
-        if usuario:
-            # Si la cuenta está bloqueada y el tiempo ya pasó, resetea el contador y desbloquea
-            if usuario.account_locked_until and usuario.account_locked_until <= timezone.now():
-                usuario.failed_login_attempts = 0
-                usuario.account_locked_until = None
-                usuario.save()
-            # Si la cuenta sigue bloqueada, no permite login
-            elif usuario.account_locked_until and usuario.account_locked_until > timezone.now():
-                return Response({
-                    "error": "Cuenta bloqueada por demasiados intentos fallidos. Intenta de nuevo en unos minutos."
-                }, status=status.HTTP_403_FORBIDDEN)
-
-        if serializer.is_valid():
-            usuario = serializer.validated_data["usuario"]
-            # Resetear intentos fallidos al login exitoso
+        # Si hay bloqueo temporal y expiró: resetear
+        if usuario and usuario.account_locked_until and usuario.account_locked_until <= timezone.now():
             usuario.failed_login_attempts = 0
             usuario.account_locked_until = None
             usuario.save()
-            login_token = str(uuid.uuid4())
-            usuario.login_token = login_token
+
+        if usuario and usuario.account_locked_until and usuario.account_locked_until > timezone.now():
+            return Response({
+                "error": "Cuenta bloqueada por demasiados intentos fallidos. Intenta de nuevo en unos minutos."
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        if serializer.is_valid():
+            usuario = serializer.validated_data["usuario"]
+            # Si el usuario debe cambiar la contraseña (creado por admin), bloquear login normal
+            if getattr(usuario, 'must_change_password', False):
+                return Response({"error": "must_change_password", "message": "Debe establecer una contraseña usando el flujo de restablecimiento."}, status=403)
+
+            usuario.failed_login_attempts = 0
+            usuario.account_locked_until = None
+            usuario.login_token = str(uuid.uuid4())
             usuario.save()
-            send_mail(
-                "Token de acceso",
-                f"Tu token de acceso para iniciar sesión es: {login_token}",
-                settings.DEFAULT_FROM_EMAIL,
-                [usuario.email],
+
+            # Enviar token por email (wrapper)
+            send_email(
+                subject="Token de acceso - EdificioApp",
+                message=f"Tu token de acceso es: {usuario.login_token}",
+                recipient_list=[usuario.email],
             )
+
             AuditoriaEvento.objects.create(
                 usuario=usuario,
                 username=usuario.username,
                 evento='login_exitoso',
                 ip=ip,
                 user_agent=user_agent,
-                detalle='Login correcto'
+                detalle='Login correcto',
             )
-            return Response({
-                "msg": "Se ha enviado un token de acceso a tu correo. Ingresa el token para completar el login.",
-                "username": usuario.username
-            }, status=status.HTTP_200_OK)
-        else:
-            # Manejar errores específicos del serializer
-            errors = serializer.errors
-            
-            # Verificar si es error de email no verificado
-            if isinstance(errors, dict) and 'email_not_verified' in str(errors):
-                # No incrementar contador de intentos fallidos para email no verificado
-                AuditoriaEvento.objects.create(
-                    usuario=usuario,
-                    username=username,
-                    evento='login_fallido',
-                    ip=ip,
-                    user_agent=user_agent,
-                    detalle='Login fallido: Email no verificado'
-                )
-                return Response({
-                    "error": "email_not_verified",
-                    "message": "Debes verificar tu correo electrónico antes de iniciar sesión",
-                    "email": usuario.email if usuario else None,
-                    "verification_endpoint": "/api/usuarios/verificar-email/",
-                    "resend_endpoint": "/api/usuarios/reenviar-verificacion/"
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
-            # Para otros errores (usuario no encontrado, contraseña incorrecta, etc.)
-            # Si el usuario existe, incrementa el contador de intentos fallidos
-            if usuario:
-                usuario.failed_login_attempts += 1
-                # Si supera el límite, bloquea la cuenta por 1 minuto (ajusta el tiempo si lo deseas)
-                if usuario.failed_login_attempts >= 5:
-                    usuario.account_locked_until = timezone.now() + timedelta(minutes=1)
-                usuario.save()
+            return Response({"msg": "Se ha enviado un token de acceso a tu correo.", "username": usuario.username})
+
+        # Manejo de errores: evitar elevar excepciones no gestionadas
+        errors = serializer.errors
+        if usuario and isinstance(errors, dict) and 'email_not_verified' in str(errors):
             AuditoriaEvento.objects.create(
-                usuario=None,
+                usuario=usuario,
                 username=username,
                 evento='login_fallido',
                 ip=ip,
                 user_agent=user_agent,
-                detalle=str(serializer.errors)
+                detalle='Login fallido: Email no verificado',
             )
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {
+                    "error": "email_not_verified",
+                    "message": "Debes verificar tu correo electrónico antes de iniciar sesión",
+                    "email": usuario.email,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if usuario:
+            usuario.failed_login_attempts += 1
+            if usuario.failed_login_attempts >= 5:
+                usuario.account_locked_until = timezone.now() + timedelta(minutes=1)
+            usuario.save()
+
+        AuditoriaEvento.objects.create(
+            usuario=None,
+            username=username,
+            evento='login_fallido',
+            ip=ip,
+            user_agent=user_agent,
+            detalle=str(errors),
+        )
+        return Response(errors, status=status.HTTP_400_BAD_REQUEST)
 
 class ForgotPasswordAPIView(APIView):
     def post(self, request):
@@ -192,11 +224,10 @@ class ForgotPasswordAPIView(APIView):
             token = str(uuid.uuid4())
             usuario.reset_password_token = token
             usuario.save()
-            send_mail(
-                "Recupera tu contraseña",
-                f"Tu token para restablecer la contraseña es: {token}",
-                settings.DEFAULT_FROM_EMAIL,
-                [usuario.email],
+            send_email(
+                subject="Recupera tu contraseña - EdificioApp",
+                message=f"Tu token para restablecer la contraseña es: {token}",
+                recipient_list=[usuario.email],
             )
             return Response({"msg": "Correo de recuperación enviado."})
         except Usuario.DoesNotExist:
@@ -210,6 +241,9 @@ class ResetPasswordAPIView(APIView):
             return Response({"error": "Token y nueva contraseña requeridos."}, status=400)
         try:
             usuario = Usuario.objects.get(reset_password_token=token)
+            # validar expiración
+            if not usuario.reset_password_expires or usuario.reset_password_expires < timezone.now():
+                return Response({"error": "Token expirado."}, status=400)
             persona = usuario.persona
             try:
                 validar_password(
@@ -222,7 +256,10 @@ class ResetPasswordAPIView(APIView):
             except serializers.ValidationError as e:
                 return Response({"error": str(e.detail[0])}, status=400)
             usuario.set_password(new_password)
+            # limpiar flags de restablecimiento
             usuario.reset_password_token = None
+            usuario.reset_password_expires = None
+            usuario.must_change_password = False
             usuario.save()
             ip = request.META.get('REMOTE_ADDR')
             user_agent = request.META.get('HTTP_USER_AGENT', '')
@@ -230,7 +267,7 @@ class ResetPasswordAPIView(APIView):
                 usuario=usuario,
                 username=usuario.username,
                 evento='reset_password',
-                ip=ip,
+                ip=get_client_ip(request),
                 user_agent=user_agent,
                 detalle='Reset de contraseña exitoso'
             )
@@ -249,21 +286,22 @@ class ResetPasswordAPIView(APIView):
             return Response({"error": "Token inválido."}, status=400)
 
 class ChangePasswordAPIView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
+
     def post(self, request):
         user = request.user
         new_password = request.data.get('new_password')
+        if not new_password:
+            return Response({"error": "new_password requerido"}, status=400)
         user.set_password(new_password)
         user.save()
-        ip = request.META.get('REMOTE_ADDR')
-        user_agent = request.META.get('HTTP_USER_AGENT', '')
         AuditoriaEvento.objects.create(
             usuario=user,
             username=user.username,
             evento='cambio_password',
-            ip=ip,
-            user_agent=user_agent,
-            detalle='Cambio de contraseña exitoso'
+            ip=get_client_ip(request),
+            user_agent=request.META.get('HTTP_USER_AGENT', ''),
+            detalle='Cambio de contraseña exitoso',
         )
         return Response({"msg": "Contraseña cambiada correctamente."})
 
@@ -275,34 +313,29 @@ class ValidateLoginTokenAPIView(APIView):
             return Response({"error": "Username y token requeridos."}, status=400)
         try:
             usuario = Usuario.objects.get(username=username)
-            if usuario.login_token == token:
-                usuario.login_token = None
-                usuario.save()
-                # Verifica si tiene 2FA activado
-                if not usuario.two_factor_enabled:
-                    # Genera el QR y responde con la URL/base64
-                    import pyotp, qrcode, io
-                    if not usuario.two_factor_secret:
-                        secret = pyotp.random_base32()
-                        usuario.two_factor_secret = secret
-                        usuario.save()
-                    else:
-                        secret = usuario.two_factor_secret
-                    otp_uri = pyotp.totp.TOTP(secret).provisioning_uri(
-                        name=usuario.email,
-                        issuer_name="EdificioApp"
-                    )
-                    img = qrcode.make(otp_uri)
-                    buf = io.BytesIO()
-                    img.save(buf, format='PNG')
-                    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-                    qr_url = f"data:image/png;base64,{img_base64}"
-                    return Response({"qr_url": qr_url})
-                else:
-                    # Si ya tiene 2FA activado, pide el código 2FA
-                    return Response({"require_2fa": True})
-            else:
+            if usuario.login_token != token:
                 return Response({"error": "Token inválido."}, status=400)
+
+            usuario.login_token = None
+            usuario.save()
+
+            # Si no tiene 2FA activado, generar QR/base64 para activar
+            if not usuario.two_factor_enabled:
+                if not usuario.two_factor_secret:
+                    usuario.two_factor_secret = pyotp.random_base32()
+                    usuario.save()
+                otp_uri = pyotp.totp.TOTP(usuario.two_factor_secret).provisioning_uri(
+                    name=usuario.email, issuer_name="EdificioApp"
+                )
+                img = qrcode.make(otp_uri)
+                buf = io.BytesIO()
+                img.save(buf, format='PNG')
+                img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+                qr_url = f"data:image/png;base64,{img_base64}"
+                return Response({"qr_url": qr_url})
+
+            # Si ya tiene 2FA activado, indicar que se requiere código 2FA
+            return Response({"require_2fa": True})
         except Usuario.DoesNotExist:
             return Response({"error": "Usuario no encontrado."}, status=400)
 

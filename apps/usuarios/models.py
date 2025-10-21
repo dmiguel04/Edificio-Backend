@@ -4,6 +4,14 @@ from django.db import models
 from apps.usuarios.crypto import encrypt_sensitive_data, decrypt_sensitive_data
 from django.utils import timezone
 import base64
+from django.utils.translation import gettext_lazy as _
+
+
+class Role(models.TextChoices):
+    ADMIN = 'admin', _('Administrador')
+    JUNTA = 'junta', _('Junta')
+    PERSONAL = 'personal', _('Personal')
+    RESIDENTE = 'residente', _('Residente')
 
 
 class Persona(models.Model):
@@ -27,9 +35,20 @@ class UsuarioManager(BaseUserManager):
         if not email:
             raise ValueError('El usuario debe tener un email')
         email = self.normalize_email(email)
-        user = self.model(username=username, email=email, **extra_fields)
+        # Asegurar que exista una Persona relacionada antes de guardar el Usuario.
+        persona = extra_fields.pop('persona', None)
+        if persona is None:
+            # Intentar reutilizar una Persona existente por email
+            persona = Persona.objects.filter(email=email).first()
+        if persona is None:
+            # Crear una Persona mínima si no existe
+            # Usamos el email como CI temporal para mantener unicidad en tests/local
+            persona = Persona.objects.create(nombre=username, apellido='', ci=email, email=email)
+
+        # Crear la instancia de Usuario con la persona ya asignada
+        user = self.model(username=username, email=email, persona=persona, **extra_fields)
+        # set_password guarda internamente; persona ya está asignada así que el save() no fallará
         user.set_password(password)
-        user.save(using=self._db)
         return user
 
     def create_superuser(self, username, email, password=None, **extra_fields):
@@ -53,12 +72,20 @@ class Usuario(AbstractBaseUser, PermissionsMixin):
     email_verification_token = models.CharField(max_length=64, null=True, blank=True)
     email_verification_expires = models.DateTimeField(null=True, blank=True)
     reset_password_token = models.CharField(max_length=64, null=True, blank=True)
+    reset_password_expires = models.DateTimeField(null=True, blank=True)
     login_token = models.CharField(max_length=64, null=True, blank=True)
     two_factor_secret = models.CharField(max_length=32, null=True, blank=True)
     two_factor_enabled = models.BooleanField(default=False)
     failed_login_attempts = models.IntegerField(default=0)
     account_locked_until = models.DateTimeField(null=True, blank=True)
     # -------------------------------------------------------------------
+    # Rol y perfil (añadido por gestión de usuarios)
+    rol = models.CharField(max_length=20, choices=Role.choices, default=Role.RESIDENTE)
+    telefono = models.CharField(max_length=20, null=True, blank=True)
+    apartamento = models.CharField(max_length=20, null=True, blank=True)
+    activo = models.BooleanField(default=True)
+    # Forzar cambio de contraseña tras creación por admin o restablecimiento
+    must_change_password = models.BooleanField(default=False)
 
     USERNAME_FIELD = "username"
     REQUIRED_FIELDS = ["email"]
@@ -76,6 +103,16 @@ class Usuario(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self):
         return self.username
+
+    def desactivar(self):
+        self.activo = False
+        self.is_active = False
+        self.save()
+
+    def activar(self):
+        self.activo = True
+        self.is_active = True
+        self.save()
 
 
 class Biometricos(models.Model):

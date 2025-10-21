@@ -89,6 +89,21 @@ class RegisterSerializer(serializers.Serializer):
             persona = Persona.objects.create(**persona_data)
 
             # Crear usuario vinculado a la persona
+            from .models import Role as _Role
+            from django.conf import settings
+
+            # Leer rol por defecto desde settings, validar contra Role.choices
+            default_role = getattr(settings, 'DEFAULT_REGISTER_ROLE', _Role.RESIDENTE)
+            if not isinstance(default_role, str):
+                try:
+                    default_role = str(default_role)
+                except Exception:
+                    default_role = _Role.RESIDENTE
+
+            valid_choices = [c[0] for c in _Role.choices]
+            if default_role not in valid_choices:
+                default_role = _Role.RESIDENTE
+
             usuario = Usuario.objects.create_user(
                 username=validated_data["username"],
                 email=persona.email,
@@ -97,6 +112,7 @@ class RegisterSerializer(serializers.Serializer):
                 is_email_verified=False,
                 email_verification_token=verification_token,
                 email_verification_expires=expires_at,
+                rol=default_role,
             )
 
         # Enviar correo fuera de la transacción
