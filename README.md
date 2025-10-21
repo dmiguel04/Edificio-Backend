@@ -299,59 +299,163 @@ cursor.execute(
 - [ ] **Notificaciones por email** para logins desde nuevos dispositivos  
 - [ ] **Endpoint de cambio de contraseña** con logout masivo automático
 - [ ] **Dashboard de seguridad** con métricas en tiempo real
-- [ ] **Integración con WebAuthn** para autenticación biométrica
+# Edificio-Backend 🏢
 
-### 🔧 **Mejoras Técnicas Planificadas**
-- [ ] **Redis** para caché de sesiones
-- [ ] **Celery** para tareas en background
-- [ ] **Docker** containerization
-- [ ] **API versioning** y documentación OpenAPI
-- [ ] **Tests automatizados** con cobertura >90%
+Backend para gestión de usuarios, autenticación segura, auditoría y administración de un edificio.
+Implementado con Django 5.x y Django REST Framework. Este README recoge lo esencial para desarrollar, probar y usar los endpoints principales —especialmente el módulo de gestión de usuarios (`apps.gestion_usuarios`).
 
 ---
 
-## 📈 Performance
+## Objetivo
 
-### ⚡ **Optimizaciones Implementadas**
-- **Logout < 200ms**: Respuesta inmediata sin bloquear frontend
-- **JWT Blacklisting**: Procesamiento en background
-- **Consultas optimizadas**: Índices en campos críticos
-- **Timeout inteligente**: Renovación automática de tokens
-
-### 📊 **Métricas de Referencia**
-- **Login**: ~500ms (incluyendo envío de email)
-- **Verificación 2FA**: ~100ms
-- **Logout**: <200ms (garantizado)
-- **Consulta auditoría**: ~50ms (con filtros)
+Proveer una API segura para:
+- Registro y verificación por correo.
+- Login con token enviado por correo y doble factor (2FA).
+- Gestión de usuarios y roles (administrador, junta, personal, residente).
+- Auditoría de eventos de seguridad.
 
 ---
 
-## 🤝 Contribución
+## Quickstart (desarrollo)
 
-1. **Fork** el repositorio
-2. **Crea** una rama para tu feature (`git checkout -b feature/nueva-caracteristica`)
-3. **Commit** tus cambios (`git commit -m 'Add: nueva característica'`)
-4. **Push** a la rama (`git push origin feature/nueva-caracteristica`)
-5. **Abre** un Pull Request
+1. Clona el repo:
+
+```powershell
+git clone https://github.com/dmiguel04/Edificio-Backend.git
+cd Edificio-Backend
+```
+
+2. Entorno virtual e instalación:
+
+```powershell
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+3. Configura variables en `edificiobackend/settings.py` (email, AES_KEY_B64, DB).
+
+4. Migraciones y arranque:
+
+```powershell
+python manage.py migrate
+python manage.py createsuperuser  # opcional
+python manage.py runserver
+```
 
 ---
 
-## 📄 Licencia
+## Endpoints clave (resumen)
 
-MIT License - Ver [LICENSE](LICENSE) para más detalles.
+Base URL (dev): `http://localhost:8000`
+
+- Auth & usuario (`apps.usuarios`):
+  - POST /api/usuarios/register/
+  - POST /api/usuarios/login/ (inicia login — backend envía `login_token` por email)
+  - POST /api/usuarios/validate-login-token/ (validar token enviado por email)
+  - POST /api/usuarios/2fa/verify/ (verificar TOTP → devuelve access/refresh)
+  - POST /api/usuarios/reset-password/ (reset con token)
+  - POST /api/usuarios/forgot-password/
+  - GET /api/usuarios/2fa/activate/ (retorna QR como data URL)
+  - POST /api/usuarios/change-password/ (autenticado)
+
+- Gestión de usuarios (`apps.gestion_usuarios` - ViewSet `UsuarioViewSet`):
+  - GET  /api/gestion-usuarios/usuarios/ (listar)
+  - POST /api/gestion-usuarios/usuarios/ (crear — admin o junta con restricciones)
+  - GET  /api/gestion-usuarios/usuarios/{id}/
+  - PATCH/PUT /api/gestion-usuarios/usuarios/{id}/
+  - DELETE /api/gestion-usuarios/usuarios/{id}/
+  - POST /api/gestion-usuarios/usuarios/{id}/assign-role/  (admin)
+  - POST /api/gestion-usuarios/usuarios/{id}/set-active/  (admin)
+  - POST /api/gestion-usuarios/usuarios/change-password/  (propio o admin-forzar)
+
+Notas: la mayoría de endpoints requieren `Authorization: Bearer <access>` salvo los marcados como AllowAny (registro/login/request-initial-reset).
 
 ---
 
-## 👨‍💻 Autor
+## Flujo recomendado para usuario creado por admin (primer acceso)
 
-**David Machicado** - [@dmiguel04](https://github.com/dmiguel04)
+Cuando un admin crea un usuario la API genera un `reset_password_token`, marca `must_change_password = true` y envía un enlace de configuración. Flujo de primer acceso:
+
+1. Usuario recibe link: `https://frontend/reset-password?token=...&u=username`.
+2. En la UI, usar `/api/usuarios/reset-password/` con `{ token, new_password }`.
+3. Tras reset exitoso: iniciar login normal `/api/usuarios/login/` → backend envía `login_token` por email.
+4. Validar login token `/api/usuarios/validate-login-token/` → si no hay 2FA, se devuelve `qr_url` para activar; si hay 2FA devuelve `require_2fa`.
+5. Verificar 2FA `/api/usuarios/2fa/verify/` → devuelve `access` y `refresh` JWT.
+
+He incluido además un endpoint público seguro para solicitar el link de primer acceso (no revela existencia):
+- POST `/api/usuarios/request-initial-reset/` with `{ "username_or_email" }` — envía enlace si corresponde.
 
 ---
 
-<div align="center">
+## Pruebas y Postman
 
-### ⭐ Si te gusta este proyecto, ¡dale una estrella! ⭐
+- Hay una colección de Postman (exportable) incluida en el repo: `postman_collections/edificioapp_admin_user.postman_collection.json` (si necesitas la guardo en el workspace).
+- Pruebas rápidas:
+  - Ejecutar tests del módulo de gestión: `python manage.py test apps.gestion_usuarios.tests -v2`
+  - Ejecutar toda la suite: `python manage.py test`
 
-**Hecho con ❤️ y Django**
+---
 
-</div>
+## Configuración de correo para desarrollo
+
+- En desarrollo es práctico usar consola para ver tokens en stdout:
+
+```py
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+```
+
+En producción configurar SMTP en `settings.py` (GMail u otro proveedor).
+
+---
+
+## Tokens y expiraciones (SIMPLE_JWT)
+
+- ACCESS_TOKEN_LIFETIME: 15 minutos (por defecto)
+- REFRESH_TOKEN_LIFETIME: 1 día
+- Rotación y blacklist activados
+
+Si en pruebas ves `token_not_valid` o `Token is expired`, usa el refresh token o re-loguea mediante el flujo 2FA.
+
+---
+
+## Migraciones y notas de DB
+
+- Se añadieron migraciones para soportar `must_change_password` y campos nuevos. Si trabajas en local:
+
+```powershell
+python manage.py makemigrations
+python manage.py migrate
+```
+
+---
+
+## Testing y CI
+
+- Los tests del módulo `apps.gestion_usuarios` están presentes y se han corrido localmente. Ejecuta:
+
+```powershell
+python manage.py test apps.gestion_usuarios.tests -v2
+```
+
+---
+
+## Git / deploy
+
+- Commit y push: `git add -A && git commit -m "..." && git push origin main` (en PowerShell separa comandos).
+
+---
+
+## Próximos pasos sugeridos
+
+- Envío de correos asíncronos (Celery) y plantillas HTML.
+- Tests que mockeen `send_mail` para verificar envíos en CI.
+- Mejoras en seguridad y dashboard de auditoría.
+
+---
+
+Si quieres que añada la colección Postman al repo (archivo JSON) o que implemente/active el endpoint `request-initial-reset` y cree tests automáticos, dímelo y lo hago.
+
+---
+
+**Autor:** David Machicado — https://github.com/dmiguel04
