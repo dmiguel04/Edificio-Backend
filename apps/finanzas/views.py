@@ -1,372 +1,747 @@
-from django.conf import settings
+# apps/finanzas/views.py
 import time
-from django.views.decorators.csrf import csrf_exempt
-from django.utils.decorators import method_decorator
-from rest_framework import status, permissions
+from django.conf import settings
+try:
+    import stripe
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+except Exception:
+    stripe = None
+from rest_framework import viewsets, status
 from rest_framework.views import APIView
+from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from .permissions import IsInRole
-from .models import StripeCustomer, Payment, WebhookEvent
-from . import models as fin_models
-from .serializers import StripeCustomerSerializer, CreatePaymentSerializer, PaymentSerializer
-from .serializers import PaymentSummarySerializer
-from .serializers import PayrollSerializer, InvoiceSerializer, PaymentGatewaySerializer, OverdueChargeSerializer
-from django.contrib.auth import get_user_model
-from apps.usuarios.models import AuditoriaEvento
-class CreateStripeCustomerAPIView(APIView):
+from .models import (
+    CuentaFinanciera, Tarjeta, Transaccion,
+    StripeCustomer, Payment, Invoice, PaymentGateway, OverdueCharge, Payroll
+)
+from .serializers import (
+    CuentaFinancieraSerializer,
+    TarjetaSerializer,
+    TransaccionSerializer,
+    CrearTarjetaSerializer,
+    TransferirFondosSerializer,
+    CreateCustomerSerializer,
+    CreatePaymentIntentSerializer,
+    ManualPaymentSerializer,
+    PaymentSerializer,
+    PaymentGatewaySerializer,
+    InvoiceCreateSerializer,
+    InvoiceSerializer,
+    OverdueChargeSerializer,
+    PayrollSerializer,
+    ProductCreateSerializer,
+    PriceCreateSerializer,
+    ProductModelSerializer,
+    PriceModelSerializer,
+)
+from . import utils as fin_utils
+from django.core.mail import send_mail
+import logging
+from django.shortcuts import get_object_or_404
+from django.http import FileResponse, Http404
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from django.utils import timezone
+import os
+from django.conf import settings
+
+class FinanzasViewSet(viewsets.ViewSet):
+    permission_classes = [IsAuthenticated]
+    
+    @action(detail=False, methods=['post'])
+    def crear_cuenta_financiera(self, request):
+        usuario = request.user
+        
+        # Verificar si ya tiene cuenta financiera
+        if hasattr(usuario, 'cuentafinanciera'):
+            return Response(
+                {"error": "El usuario ya tiene una cuenta financiera"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if stripe is None:
+            return Response({'error': 'stripe library no instalado'}, status=status.HTTP_501_NOT_IMPLEMENTED)
+
+        try:
+            # Crear cuenta conectada en Stripe
+            account = stripe.Account.create(
+                type='custom',
+                country='US',
+                email=usuario.email,
+                business_type='individual',
+                individual={
+                    'first_name': usuario.first_name,
+                    'last_name': usuario.last_name,
+                    'email': usuario.email,
+                },
+                capabilities={
+                    'card_payments': {'requested': True},
+                    'transfers': {'requested': True},
+                    'treasury': {'requested': True},
+                },
+                tos_acceptance={
+                    'date': int(time.time()),
+                    'ip': request.META.get('REMOTE_ADDR', '127.0.0.1'),
+                }
+            )
+            
+            # Crear cuenta financiera en Stripe
+            financial_account = stripe.treasury.FinancialAccount.create(
+                supported_currencies=['usd'],
+                features={
+                    'card_issuing': {'requested': True},
+                    'deposit_insurance': {'requested': True},
+                    'financial_addresses': {'aba': {'requested': True}}
+                },
+                stripe_account=account.id
+            )
+            
+            # Guardar en nuestra base de datos
+            cuenta_financiera = CuentaFinanciera.objects.create(
+                usuario=usuario,
+                stripe_account_id=account.id,
+                stripe_financial_account_id=financial_account.id,
+                activa=True
+            )
+            
+            serializer = CuentaFinancieraSerializer(cuenta_financiera)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+            
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+    
+    @action(detail=False, methods=['post'])
+    def crear_tarjeta(self, request):
+        serializer = CrearTarjetaSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        
+        usuario = request.user
+        
+        if stripe is None:
+            return Response({'error': 'stripe library no instalado'}, status=status.HTTP_501_NOT_IMPLEMENTED)
+
+        try:
+            # Verificar si el usuario tiene cuenta financiera
+            cuenta_financiera = CuentaFinanciera.objects.get(usuario=usuario)
+            
+            # Crear cardholder en Stripe
+            cardholder = stripe.issuing.Cardholder.create(
+                type='individual',
+                name=f"{usuario.first_name} {usuario.last_name}",
+                email=usuario.email,
+                status='active',
+                stripe_account=cuenta_financiera.stripe_account_id
+            )
+            
+            # Crear tarjeta en Stripe
+            card = stripe.issuing.Card.create(
+                cardholder=cardholder.id,
+                currency='usd',
+                type=serializer.validated_data['tipo'],
+                status='active',
+                financial_account=cuenta_financiera.stripe_financial_account_id,
+                stripe_account=cuenta_financiera.stripe_account_id
+            )
+            
+            # Guardar en nuestra base de datos
+            tarjeta = Tarjeta.objects.create(
+                cuenta_financiera=cuenta_financiera,
+                stripe_card_id=card.id,
+                stripe_cardholder_id=cardholder.id,
+                tipo=serializer.validated_data['tipo'],
+                ultimos_digitos=card.last4
+            )
+            
+            return Response(TarjetaSerializer(tarjeta).data, status=status.HTTP_201_CREATED)
+            
+        except CuentaFinanciera.DoesNotExist:
+            return Response(
+                {"error": "El usuario no tiene una cuenta financiera activa"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+    
+    @action(detail=False, methods=['get'])
+    def obtener_saldo(self, request):
+        usuario = request.user
+        
+        if stripe is None:
+            return Response({'error': 'stripe library no instalado'}, status=status.HTTP_501_NOT_IMPLEMENTED)
+
+        try:
+            # Verificar si el usuario tiene cuenta financiera
+            cuenta_financiera = CuentaFinanciera.objects.get(usuario=usuario)
+            
+            # Obtener saldo de Stripe
+            financial_account = stripe.treasury.FinancialAccount.retrieve(
+                cuenta_financiera.stripe_financial_account_id,
+                stripe_account=cuenta_financiera.stripe_account_id
+            )
+            
+            return Response({
+                "balance": financial_account.balance.available,
+                "currency": financial_account.balance.currency
+            })
+            
+        except CuentaFinanciera.DoesNotExist:
+            return Response(
+                {"error": "El usuario no tiene una cuenta financiera activa"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+    
+    @action(detail=False, methods=['post'])
+    def transferir_fondos(self, request):
+        serializer = TransferirFondosSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        
+        usuario = request.user
+        
+        if stripe is None:
+            return Response({'error': 'stripe library no instalado'}, status=status.HTTP_501_NOT_IMPLEMENTED)
+
+        try:
+            # Verificar si el usuario tiene cuenta financiera
+            cuenta_financiera = CuentaFinanciera.objects.get(usuario=usuario)
+            
+            # Crear transferencia en Stripe
+            outbound_transfer = stripe.treasury.OutboundTransfer.create(
+                financial_account=cuenta_financiera.stripe_financial_account_id,
+                destination_payment_method=serializer.validated_data['destination_payment_method'],
+                amount=serializer.validated_data['monto'],
+                currency='usd',
+                description=serializer.validated_data.get('descripcion', 'Transferencia saliente'),
+                stripe_account=cuenta_financiera.stripe_account_id
+            )
+            
+            # Registrar la transacción
+            transaccion = Transaccion.objects.create(
+                cuenta_financiera=cuenta_financiera,
+                stripe_transaction_id=outbound_transfer.id,
+                tipo='transfer_out',
+                monto=serializer.validated_data['monto'],
+                moneda='usd',
+                estado=outbound_transfer.status,
+                descripcion=serializer.validated_data.get('descripcion', 'Transferencia saliente')
+            )
+            
+            return Response(TransaccionSerializer(transaccion).data)
+            
+        except CuentaFinanciera.DoesNotExist:
+            return Response(
+                {"error": "El usuario no tiene una cuenta financiera activa"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+    
+    @action(detail=False, methods=['get'])
+    def listar_transacciones(self, request):
+        usuario = request.user
+        
+        try:
+            # Verificar si el usuario tiene cuenta financiera
+            cuenta_financiera = CuentaFinanciera.objects.get(usuario=usuario)
+            
+            # Obtener transacciones de Stripe
+            transactions = stripe.treasury.Transaction.list(
+                financial_account=cuenta_financiera.stripe_financial_account_id,
+                limit=20,
+                stripe_account=cuenta_financiera.stripe_account_id
+            )
+            
+            # Sincronizar con nuestra base de datos
+            for transaction in transactions.data:
+                # Verificar si ya existe
+                if not Transaccion.objects.filter(stripe_transaction_id=transaction.id).exists():
+                    # Determinar el tipo de transacción
+                    tipo = 'deposit'
+                    if transaction.flow == 'outbound':
+                        tipo = 'transfer_out'
+                    elif transaction.flow == 'inbound':
+                        tipo = 'transfer_in'
+                    
+                    Transaccion.objects.create(
+                        cuenta_financiera=cuenta_financiera,
+                        stripe_transaction_id=transaction.id,
+                        tipo=tipo,
+                        monto=transaction.amount,
+                        moneda=transaction.currency,
+                        estado='succeeded',
+                        descripcion=transaction.description
+                    )
+            
+            # Obtener transacciones actualizadas
+            transacciones = Transaccion.objects.filter(cuenta_financiera=cuenta_financiera).order_by('-fecha_creacion')[:20]
+            
+            return Response(TransaccionSerializer(transacciones, many=True).data)
+            
+        except CuentaFinanciera.DoesNotExist:
+            return Response(
+                {"error": "El usuario no tiene una cuenta financiera activa"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+# --- Endpoints adicionales solicitados ---
+
+
+class CreateCustomerAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        user = request.user
-        # Si ya existe, devolver
-        if hasattr(user, 'stripe_customer'):
-            ser = StripeCustomerSerializer(user.stripe_customer)
-            return Response(ser.data)
-        # Crear customer en Stripe
+        serializer = CreateCustomerSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data.get('email') or getattr(request.user, 'email', None)
+        name = serializer.validated_data.get('name') or (f"{getattr(request.user, 'persona', None) and request.user.persona.nombre or ''} {getattr(request.user, 'persona', None) and request.user.persona.apellido or ''}".strip())
+        if not email:
+            return Response({'error': 'email requerido'}, status=status.HTTP_400_BAD_REQUEST)
         try:
-            from .utils import create_stripe_customer
-            customer = create_stripe_customer(email=user.email, name=str(user))
+            customer = fin_utils.create_stripe_customer(email=email, name=name)
+            StripeCustomer.objects.update_or_create(usuario=request.user, defaults={'stripe_customer_id': customer['id']})
+            return Response({'stripe_customer_id': customer['id']}, status=status.HTTP_201_CREATED)
         except Exception as e:
-            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-        obj = StripeCustomer.objects.create(usuario=user, stripe_customer_id=customer['id'])
-        ser = StripeCustomerSerializer(obj)
-        return Response(ser.data, status=status.HTTP_201_CREATED)
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class CreatePaymentIntentAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
-    def post(self, request):
-        serializer = CreatePaymentSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
+    def get_permissions(self):
+        # Allow unauthenticated requests in DEBUG for local development convenience.
+        if getattr(settings, 'DEBUG', False):
+            return [AllowAny()]
+        return [IsAuthenticated()]
 
-        user = request.user
-        if not hasattr(user, 'stripe_customer'):
-            return Response({'detail': 'Stripe customer not found. Create one first.'}, status=status.HTTP_400_BAD_REQUEST)
+    def post(self, request):
+        serializer = CreatePaymentIntentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        amount = serializer.validated_data['amount']
+        currency = serializer.validated_data.get('currency', 'usd')
+        customer_id = serializer.validated_data.get('customer_id')
+        # si no hay customer_id, comprobar si usuario tiene StripeCustomer registrado
+        user_obj = request.user
+        if not customer_id:
+            if getattr(request, 'user', None) and getattr(request.user, 'is_authenticated', False):
+                if not hasattr(request.user, 'stripe_customer'):
+                    return Response({'error': 'stripe customer no encontrado'}, status=status.HTTP_400_BAD_REQUEST)
+                customer_id = request.user.stripe_customer.stripe_customer_id
+            else:
+                # In DEBUG, allow anonymous/dev requests: create or use a dev user to attach Payment records
+                if getattr(settings, 'DEBUG', False):
+                    from django.contrib.auth import get_user_model
+                    User = get_user_model()
+                    dev_username = getattr(settings, 'DEV_STRIPE_USER', 'dev_stripe_user')
+                    dev_email = getattr(settings, 'DEV_STRIPE_EMAIL', 'dev@localhost')
+                    try:
+                        user_obj, created = User.objects.get_or_create(username=dev_username, defaults={'email': dev_email})
+                        if created:
+                            try:
+                                user_obj.set_password('devpass')
+                                user_obj.save()
+                            except Exception:
+                                pass
+                    except Exception:
+                        user_obj = None
+                    # do not require a stripe_customer for dev flow; customer_id can be None
+                else:
+                    return Response({'error': 'stripe customer no encontrado'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            from .utils import create_payment_intent
-            intent = create_payment_intent(amount=data['amount'], currency=data.get('currency', 'usd'), customer_id=user.stripe_customer.stripe_customer_id)
+            # create internal Payment record first so we can reconcile later
+            payment_user = user_obj if user_obj is not None else request.user
+            payment = Payment.objects.create(usuario=payment_user, stripe_payment_intent='', amount=int(amount), currency=currency, status='pending')
+            pm_types = request.data.get('payment_method_types')
+            # allow passthrough extras like confirm, return_url
+            extras = {}
+            if 'confirm' in request.data:
+                extras['confirm'] = bool(request.data.get('confirm'))
+            if 'return_url' in request.data:
+                extras['return_url'] = request.data.get('return_url')
+            # include any other extras explicitly allowed
+            allowed_extras = ['payment_method_options', 'setup_future_usage']
+            for k in allowed_extras:
+                if k in request.data:
+                    extras[k] = request.data.get(k)
+
+            intent = fin_utils.create_payment_intent_with_metadata(int(amount), currency, customer_id, metadata={'payment_id': str(payment.id)}, payment_method_types=pm_types, **extras)
+            # store the returned intent id
+            payment.stripe_payment_intent = intent.get('id')
+            payment.status = intent.get('status', 'pending')
+            payment.save()
+            # Build response: include client_secret, id, payment_id and next_action & raw intent for debugging
+            resp = {'client_secret': intent.get('client_secret'), 'id': intent.get('id'), 'payment_id': payment.id}
+            if intent.get('next_action'):
+                resp['next_action'] = intent.get('next_action')
+            # include minimal intent object for frontend debug if running in DEBUG
+            if getattr(settings, 'DEBUG', False):
+                # convert stripe object to dict safely
+                try:
+                    resp['payment_intent'] = dict(intent)
+                except Exception:
+                    resp['payment_intent'] = intent
+            return Response(resp)
         except Exception as e:
-            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        payment = Payment.objects.create(usuario=user, stripe_payment_intent=intent['id'], amount=data['amount'], currency=data.get('currency', 'usd'), status='pending')
 
-        return Response({'client_secret': intent['client_secret'], 'payment_id': payment.id})
+class CheckoutSessionAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        if getattr(settings, 'DEBUG', False):
+            return [AllowAny()]
+        return [IsAuthenticated()]
+
+    def post(self, request):
+        # expected payload: items (list of {price_data: {currency, product_data: {name, images}, unit_amount}, quantity}), success_url, cancel_url
+        data = request.data
+        items = data.get('line_items')
+        success_url = data.get('success_url')
+        cancel_url = data.get('cancel_url')
+        if not items or not success_url or not cancel_url:
+            return Response({'error': 'line_items, success_url y cancel_url requeridos'}, status=status.HTTP_400_BAD_REQUEST)
+        customer_id = None
+        user_obj = request.user
+        if getattr(request, 'user', None) and getattr(request.user, 'is_authenticated', False):
+            if hasattr(request.user, 'stripe_customer'):
+                customer_id = request.user.stripe_customer.stripe_customer_id
+        else:
+            # allow anonymous/dev requests in DEBUG: use dev user
+            if getattr(settings, 'DEBUG', False):
+                from django.contrib.auth import get_user_model
+                User = get_user_model()
+                dev_username = getattr(settings, 'DEV_STRIPE_USER', 'dev_stripe_user')
+                dev_email = getattr(settings, 'DEV_STRIPE_EMAIL', 'dev@localhost')
+                try:
+                    user_obj, created = User.objects.get_or_create(username=dev_username, defaults={'email': dev_email})
+                    if created:
+                        try:
+                            user_obj.set_password('devpass')
+                            user_obj.save()
+                        except Exception:
+                            pass
+                except Exception:
+                    user_obj = None
+        # optional: frontend can request a PaymentIntent instead of Checkout Session
+        create_pi = data.get('create_payment_intent', False)
+        if create_pi:
+            # expected: amount (int cents) and currency
+            amount = data.get('amount')
+            currency = data.get('currency', 'usd')
+            if not amount:
+                return Response({'error': 'amount requerido para create_payment_intent'}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                # create internal Payment record first so we can reconcile later
+                payment = Payment.objects.create(usuario=request.user, stripe_payment_intent='', amount=int(amount), currency=currency, status='pending')
+                pm_types = data.get('payment_method_types')
+                intent = fin_utils.create_payment_intent_with_metadata(int(amount), currency, customer_id, metadata={'payment_id': str(payment.id)}, payment_method_types=pm_types)
+                payment.stripe_payment_intent = intent.get('id')
+                payment.status = intent.get('status', 'pending')
+                payment.save()
+                resp = {'client_secret': intent.get('client_secret'), 'id': intent.get('id'), 'payment_id': payment.id}
+                if intent.get('next_action'):
+                    resp['next_action'] = intent.get('next_action')
+                return Response(resp)
+            except Exception as e:
+                return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        try:
+            session = fin_utils.create_checkout_session(line_items=items, success_url=success_url, cancel_url=cancel_url, customer=customer_id)
+            return Response({'url': session.url, 'id': session.id})
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class SubscriptionCreateAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        # payload: price_id
+        price_id = request.data.get('price_id')
+        if not price_id:
+            return Response({'error': 'price_id requerido'}, status=status.HTTP_400_BAD_REQUEST)
+        if not hasattr(request.user, 'stripe_customer'):
+            return Response({'error': 'stripe customer no encontrado'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            sub = fin_utils.create_subscription(request.user.stripe_customer.stripe_customer_id, price_id)
+            return Response({'id': sub.id, 'status': sub.status})
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class PaymentListAPIView(APIView):
-    """Listar pagos del usuario (o todos si es staff)."""
-    # Authentication required; role-based visibility is decidida en el método GET
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        user = request.user
-        # is_staff or roles admin/junta see all
-        if user.is_staff or getattr(user, 'rol', None) in ('admin', 'junta'):
+        # 'junta' role sees list but without usuario field; staff sees all; normal users see own
+        role = getattr(request.user, 'rol', None)
+        if request.user.is_staff:
             qs = Payment.objects.all().order_by('-created_at')
+            data = PaymentSerializer(qs, many=True).data
+            return Response(data)
+        elif role == 'junta':
+            qs = Payment.objects.all().order_by('-created_at')
+            data = PaymentSerializer(qs, many=True).data
+            # remove usuario field from each item
+            for item in data:
+                item.pop('usuario', None)
+            return Response(data)
         else:
-            # Personal can see payments for the building (but not detailed personal data) - for now show all payments for user's building
-            if getattr(user, 'rol', None) == 'personal':
-                qs = Payment.objects.all().order_by('-created_at')
-            else:
-                qs = Payment.objects.filter(usuario=user).order_by('-created_at')
-        # If the user is 'junta' or requests summary, return anonymized serializer
-        summary_param = request.query_params.get('summary')
-        if getattr(user, 'rol', None) == 'junta' or (summary_param and summary_param.lower() in ('1','true','yes')):
-            ser = PaymentSummarySerializer(qs, many=True)
-        else:
-            ser = PaymentSerializer(qs, many=True)
-        return Response(ser.data)
+            qs = Payment.objects.filter(usuario=request.user).order_by('-created_at')
+            data = PaymentSerializer(qs, many=True).data
+            return Response(data)
 
 
 class PaymentDetailAPIView(APIView):
-    """Detalle de un pago: sólo propietario o staff."""
-    # Authentication required; detalle solo para propietario o roles admin/junta
     permission_classes = [IsAuthenticated]
 
     def get(self, request, pk):
-        try:
-            payment = Payment.objects.get(pk=pk)
-        except Payment.DoesNotExist:
-            return Response({'detail': 'Not found.'}, status=404)
-
-        if not (request.user.is_staff or payment.usuario == request.user or getattr(request.user, 'rol', None) in ('admin', 'junta')):
-            return Response({'detail': 'Forbidden.'}, status=403)
-
-        ser = PaymentSerializer(payment)
-        return Response(ser.data)
+        payment = get_object_or_404(Payment, pk=pk)
+        if not request.user.is_staff and payment.usuario != request.user:
+            return Response({'error': 'sin permiso'}, status=status.HTTP_403_FORBIDDEN)
+        return Response(PaymentSerializer(payment).data)
 
 
-@method_decorator(csrf_exempt, name='dispatch')
-class StripeWebhookView(APIView):
-    permission_classes = [permissions.AllowAny]
-
-    def post(self, request):
-        payload = request.body
-        sig_header = request.META.get('HTTP_STRIPE_SIGNATURE')
-        webhook_secret = getattr(settings, 'STRIPE_WEBHOOK_SECRET', None)
-
-        try:
-            from .utils import construct_webhook_event
-            event = construct_webhook_event(payload, sig_header, webhook_secret)
-        except Exception:
-            return Response(status=400)
-
-        # Guardar evento (idempotencia)
-        evt_id = event.get('id')
-        if not evt_id:
-            return Response(status=400)
-
-        obj, created = WebhookEvent.objects.get_or_create(event_id=evt_id, defaults={'payload': event})
-        if not created and obj.processed:
-            # Ya procesado
-            return Response({'status': 'already_processed'})
-
-        # Procesar eventos relevantes
-        if event['type'] == 'payment_intent.succeeded':
-            pi = event['data']['object']
-            pi_id = pi['id']
-            Payment.objects.filter(stripe_payment_intent=pi_id).update(status='succeeded')
-
-        if event['type'] in ('payment_intent.payment_failed', 'payment_intent.canceled'):
-            pi = event['data']['object']
-            pi_id = pi['id']
-            Payment.objects.filter(stripe_payment_intent=pi_id).update(status='failed')
-
-        # marcar procesado
-        obj.processed = True
-        from django.utils import timezone
-        obj.processed_at = timezone.now()
-        obj.save()
-
-        return Response({'status': 'ok'})
-
-
-class RegistroPagoManualAPIView(APIView):
-    """Permite al personal o admin registrar un pago manual (efectivo/cheque) para un residente."""
-    permission_classes = [IsAuthenticated, IsInRole]
-    allowed_roles = ['personal', 'admin']
-
-    def post(self, request):
-        # Esperamos: usuario_id (id del usuario residente), amount, currency, metodo ('efectivo'|'cheque')
-        data = request.data
-        usuario_id = data.get('usuario_id')
-        amount = data.get('amount')
-        currency = data.get('currency', 'usd')
-        metodo = data.get('metodo', 'efectivo')
-
-        if not usuario_id or not amount:
-            return Response({'detail': 'usuario_id and amount are required.'}, status=400)
-
-        # Validaciones: limites máximos
-        try:
-            amount_int = int(amount)
-        except Exception:
-            return Response({'detail': 'amount must be an integer (in cents).'}, status=400)
-
-        from django.conf import settings as dj_settings
-        if amount_int <= 0 or amount_int > dj_settings.MAX_MANUAL_PAYMENT_AMOUNT:
-            return Response({'detail': 'amount out of allowed range.'}, status=400)
-
-        try:
-            from django.contrib.auth import get_user_model
-            User = get_user_model()
-            usuario = User.objects.get(pk=usuario_id)
-        except Exception:
-            return Response({'detail': 'Usuario no encontrado.'}, status=404)
-
-        # Crear Payment local sin interacción con Stripe (registro manual)
-        payment = Payment.objects.create(usuario=usuario, stripe_payment_intent=f'manual-{usuario_id}-{int(amount)}-{int(time.time())}', amount=int(amount), currency=currency, status='succeeded')
-
-        ser = PaymentSerializer(payment)
-
-        # Registrar auditoría
-        try:
-            AuditoriaEvento.objects.create(usuario=request.user, username=request.user.username, evento='reset_password', detalle=f'Pago manual registrado para usuario {usuario_id}: {amount} {currency}')
-        except Exception:
-            pass
-
-        return Response(ser.data, status=201)
-
-
-class PayrollAPIView(APIView):
+class ManualPaymentAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        # Crear nómina (personal puede crear draft; admin/junta pueden cambiar estados)
-        data = request.data
-        name = data.get('name')
-        period_start = data.get('period_start')
-        period_end = data.get('period_end')
-        total_amount = data.get('total_amount', 0)
-        if not name or not period_start or not period_end:
-            return Response({'detail': 'name, period_start and period_end required.'}, status=400)
-
-        payroll = fin_models.Payroll.objects.create(name=name, period_start=period_start, period_end=period_end, total_amount=total_amount, created_by=request.user)
-        ser = PayrollSerializer(payroll)
-        return Response(ser.data, status=201)
-
-
-class PayrollApproveAPIView(APIView):
-    permission_classes = [IsAuthenticated, IsInRole]
-    allowed_roles = ['junta']
-
-    def post(self, request, pk):
+        serializer = ManualPaymentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        amount = serializer.validated_data['amount']
+        currency = serializer.validated_data.get('currency', 'usd')
+        reference = serializer.validated_data.get('reference')
+        # Limit manual payment amount for non-staff users
+        MAX_MANUAL = 10_000_00  # e.g., $10,000 in cents
         try:
-            payroll = fin_models.Payroll.objects.get(pk=pk)
-        except fin_models.Payroll.DoesNotExist:
-            return Response({'detail': 'Not found.'}, status=404)
-
-        if payroll.status != 'pending_approval':
-            return Response({'detail': 'Payroll not pending approval.'}, status=400)
-
-        payroll.status = 'approved'
-        payroll.save()
-        AuditoriaEvento.objects.create(usuario=request.user, username=request.user.username, evento='cambio_password', detalle=f'Payroll {pk} approved')
-        return Response({'status': 'approved'})
-
-
-class PayrollExecuteAPIView(APIView):
-    permission_classes = [IsAuthenticated, IsInRole]
-    allowed_roles = ['admin']
-
-    def post(self, request, pk):
-        try:
-            payroll = fin_models.Payroll.objects.get(pk=pk)
-        except fin_models.Payroll.DoesNotExist:
-            return Response({'detail': 'Not found.'}, status=404)
-
-        if payroll.status != 'approved':
-            return Response({'detail': 'Payroll not approved.'}, status=400)
-
-        payroll.status = 'executed'
-        payroll.save()
-        AuditoriaEvento.objects.create(usuario=request.user, username=request.user.username, evento='cambio_password', detalle=f'Payroll {pk} executed')
-        return Response({'status': 'executed'})
-
-
-class InvoiceAPIView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request):
-        data = request.data
-        usuario_id = data.get('usuario_id')
-        amount = data.get('amount')
-        desc = data.get('description', '')
-        if not usuario_id or not amount:
-            return Response({'detail': 'usuario_id and amount required.'}, status=400)
-        try:
-            User = get_user_model()
-            usuario = User.objects.get(pk=usuario_id)
+            if not request.user.is_staff and int(amount) > MAX_MANUAL:
+                return Response({'error': 'amount exceeds manual limit'}, status=status.HTTP_400_BAD_REQUEST)
         except Exception:
-            return Response({'detail': 'Usuario no encontrado.'}, status=404)
+            return Response({'error': 'invalid amount'}, status=status.HTTP_400_BAD_REQUEST)
 
-        inv = fin_models.Invoice.objects.create(usuario=usuario, amount=amount, description=desc)
-        AuditoriaEvento.objects.create(usuario=request.user, username=request.user.username, evento='reset_password', detalle=f'Invoice {inv.id} created for {usuario_id}')
-        ser = InvoiceSerializer(inv)
-        return Response(ser.data, status=201)
+        try:
+            now_ts = int(timezone.now().timestamp())
+            pi_id = f"manual-{request.user.id}-{now_ts}"
+            payment = Payment.objects.create(usuario=request.user, stripe_payment_intent=pi_id, amount=int(amount), currency=currency, status='succeeded')
+            return Response({'id': payment.id, 'status': payment.status}, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class PaymentGatewayAPIView(APIView):
-    permission_classes = [IsAuthenticated, IsInRole]
-    allowed_roles = ['admin']
+class GatewaysListAPIView(APIView):
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        qs = fin_models.PaymentGateway.objects.all()
-        ser = PaymentGatewaySerializer(qs, many=True)
-        return Response(ser.data)
+        # if admin route requested, ensure only staff can access
+        if getattr(request.user, 'is_staff', False) is False and request.path.endswith('/admin/'):
+            return Response({'error': 'sin permiso'}, status=status.HTTP_403_FORBIDDEN)
+        qs = PaymentGateway.objects.filter(enabled=True)
+        data = PaymentGatewaySerializer(qs, many=True).data
+        return Response(data)
+
+
+class InvoicesListCreateAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if request.user.is_staff:
+            qs = Invoice.objects.all().order_by('-issued_at')
+        else:
+            qs = Invoice.objects.filter(usuario=request.user).order_by('-issued_at')
+        data = InvoiceSerializer(qs, many=True).data
+        return Response(data)
 
     def post(self, request):
-        data = request.data
-        name = data.get('name')
-        config = data.get('config', {})
-        enabled = data.get('enabled', False)
-        gw = fin_models.PaymentGateway.objects.create(name=name, config=config, enabled=enabled)
-        AuditoriaEvento.objects.create(usuario=request.user, username=request.user.username, evento='reset_password', detalle=f'Payment gateway {name} created')
-        ser = PaymentGatewaySerializer(gw)
-        return Response(ser.data, status=201)
+        serializer = InvoiceCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        usuario_id = data.get('usuario_id')
+        # owner: staff can create for others
+        if request.user.is_staff and usuario_id:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            usuario = get_object_or_404(User, pk=usuario_id)
+        else:
+            usuario = request.user
+        invoice = Invoice.objects.create(usuario=usuario, amount=int(data['amount']), currency=data.get('currency','usd'), description=data.get('description',''), due_date=data.get('due_date', None))
+        try:
+            invoice.generate_pdf_qr()
+        except Exception:
+            pass
+        return Response(InvoiceSerializer(invoice).data, status=status.HTTP_201_CREATED)
+
+
+class ProductPriceAdminAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        # create product or price depending on payload
+        if not request.user.is_staff:
+            return Response({'error': 'sin permiso'}, status=status.HTTP_403_FORBIDDEN)
+        if 'name' in request.data:
+            serializer = ProductCreateSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            data = serializer.validated_data
+            try:
+                product = fin_utils.create_product(name=data['name'], description=data.get('description'))
+                # persist locally
+                from .models import Product as ProductModel
+                prod = ProductModel.objects.create(stripe_product_id=product.id, name=product.name, description=getattr(product,'description',''))
+                return Response(ProductModelSerializer(prod).data)
+            except Exception as e:
+                return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        elif 'product_id' in request.data:
+            serializer = PriceCreateSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            data = serializer.validated_data
+            try:
+                price = fin_utils.create_price(product_id=data['product_id'], unit_amount=data['unit_amount'], currency=data.get('currency','usd'), recurring=data.get('recurring'))
+                # persist locally
+                from .models import Price as PriceModel, Product as ProductModel
+                prod = ProductModel.objects.filter(stripe_product_id=price.product).first()
+                if not prod:
+                    # create a minimal product record
+                    prod = ProductModel.objects.create(stripe_product_id=price.product, name=str(price.product), description='')
+                pr = PriceModel.objects.create(stripe_price_id=price.id, product=prod, unit_amount=price.unit_amount, currency=price.currency, recurring=getattr(price,'recurring', None) or None)
+                return Response(PriceModelSerializer(pr).data)
+            except Exception as e:
+                return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        else:
+            return Response({'error': 'payload inválido'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ProductListAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import Product
+        qs = Product.objects.all().order_by('-created_at')
+        return Response(ProductModelSerializer(qs, many=True).data)
+
+
+class PriceListAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import Price
+        qs = Price.objects.all().order_by('-created_at')
+        return Response(PriceModelSerializer(qs, many=True).data)
+
+
+class RefundAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if not request.user.is_staff:
+            return Response({'error': 'sin permiso'}, status=status.HTTP_403_FORBIDDEN)
+        payment_intent = request.data.get('payment_intent')
+        amount = request.data.get('amount')
+        if not payment_intent:
+            return Response({'error': 'payment_intent requerido'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            refund = fin_utils.create_refund(payment_intent, amount=int(amount) if amount else None)
+            # Optionally email receipt
+            try:
+                send_mail('Refund processed', f'Refund for {payment_intent}: {refund.id}', None, [request.user.email])
+            except Exception:
+                logging.exception('Failed to send refund email')
+            return Response({'id': getattr(refund, 'id', None)})
+        except Exception as e:
+            logging.exception('Refund failed')
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class InvoiceDetailAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        invoice = get_object_or_404(Invoice, pk=pk)
+        if not request.user.is_staff and invoice.usuario != request.user:
+            return Response({'error': 'sin permiso'}, status=status.HTTP_403_FORBIDDEN)
+        return Response(InvoiceSerializer(invoice).data)
+
+
+class InvoiceDownloadAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        invoice = get_object_or_404(Invoice, pk=pk)
+        if not request.user.is_staff and invoice.usuario != request.user:
+            return Response({'error': 'sin permiso'}, status=status.HTTP_403_FORBIDDEN)
+        # ensure pdf exists
+        media_path = None
+        if invoice.pdf_url:
+            # pdf_url stored as MEDIA_URL/path
+            rel = invoice.pdf_url.replace(settings.MEDIA_URL, '').lstrip('/\\')
+            media_path = os.path.join(settings.MEDIA_ROOT, rel)
+        if not media_path or not os.path.exists(media_path):
+            try:
+                invoice.generate_pdf_qr()
+                rel = invoice.pdf_url.replace(settings.MEDIA_URL, '').lstrip('/\\')
+                media_path = os.path.join(settings.MEDIA_ROOT, rel)
+            except Exception:
+                raise Http404
+        return FileResponse(open(media_path, 'rb'), content_type='application/pdf')
 
 
 class OverdueChargeAPIView(APIView):
-    permission_classes = [IsAuthenticated, IsInRole]
-    allowed_roles = ['admin']
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        data = request.data
-        usuario_id = data.get('usuario_id')
-        amount = data.get('amount')
-        reason = data.get('reason', '')
-        if not usuario_id or not amount:
-            return Response({'detail': 'usuario_id and amount required.'}, status=400)
-        try:
-            User = get_user_model()
-            usuario = User.objects.get(pk=usuario_id)
-        except Exception:
-            return Response({'detail': 'Usuario no encontrado.'}, status=404)
-
-        try:
-            amount_int = int(amount)
-        except Exception:
-            return Response({'detail': 'amount must be an integer (in cents).'}, status=400)
-
-        from django.conf import settings as dj_settings
-        if amount_int <= 0 or amount_int > dj_settings.MAX_OVERDUE_CHARGE_AMOUNT:
-            return Response({'detail': 'amount out of allowed range.'}, status=400)
-
-        charge = fin_models.OverdueCharge.objects.create(usuario=usuario, amount=amount_int, reason=reason, applied_by=request.user)
-        AuditoriaEvento.objects.create(usuario=request.user, username=request.user.username, evento='acceso_no_autorizado', detalle=f'Applied overdue charge {charge.id} to {usuario_id}')
-        ser = OverdueChargeSerializer(charge)
-        return Response(ser.data, status=201)
+        # only staff may apply charges
+        if not request.user.is_staff:
+            return Response({'error': 'sin permiso'}, status=status.HTTP_403_FORBIDDEN)
+        serializer = OverdueChargeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        usuario = get_object_or_404(User, pk=data['usuario_id'])
+        invoice = None
+        if data.get('invoice_id'):
+            invoice = get_object_or_404(Invoice, pk=data['invoice_id'])
+        charge = OverdueCharge.objects.create(usuario=usuario, invoice=invoice, amount=int(data['amount']), reason=data.get('reason',''), applied_by=request.user)
+        return Response({'id': charge.id}, status=status.HTTP_201_CREATED)
 
 
-class InvoiceVerifyView(APIView):
-    permission_classes = [permissions.AllowAny]
+class PayrollListCreateAPIView(APIView):
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        # token in query param 't'
-        t = request.query_params.get('t')
-        if not t:
-            return Response({'detail': 'token required as query param t'}, status=400)
+        if not request.user.is_staff:
+            return Response({'error': 'sin permiso'}, status=status.HTTP_403_FORBIDDEN)
+        qs = Payroll.objects.all().order_by('-created_at')
+        data = [{'id': p.id, 'name': p.name, 'period_start': p.period_start, 'period_end': p.period_end, 'total_amount': p.total_amount, 'status': p.status} for p in qs]
+        return Response(data)
 
-        import base64, json, hmac, hashlib
-        try:
-            raw = base64.urlsafe_b64decode(t.encode())
-            obj = json.loads(raw)
-        except Exception:
-            return Response({'detail': 'invalid token'}, status=400)
-
-        sig = obj.pop('sig', None)
-        key = getattr(settings, 'INVOICE_SIGNING_KEY', None)
-        if key and sig:
-            payload = json.dumps(obj, separators=(",", ":"), sort_keys=True).encode()
-            expected = hmac.new(key.encode('utf-8'), payload, hashlib.sha256).hexdigest()
-            from django.utils.crypto import constant_time_compare
-            if not constant_time_compare(expected, sig):
-                return Response({'detail': 'invalid signature'}, status=400)
-
-        # expect id like inv_5
-        inv_id = obj.get('id')
-        if not inv_id or not inv_id.startswith('inv_'):
-            return Response({'detail': 'invalid id'}, status=400)
-
-        try:
-            invoice_pk = int(inv_id.split('_', 1)[1])
-        except Exception:
-            return Response({'detail': 'invalid id'}, status=400)
-
-        try:
-            inv = fin_models.Invoice.objects.get(pk=invoice_pk)
-        except fin_models.Invoice.DoesNotExist:
-            return Response({'detail': 'invoice not found'}, status=404)
-
-        # If in DEBUG, redirect to media URL; otherwise return a JSON with download token or redirect to a protected endpoint
-        if settings.DEBUG:
-            from django.shortcuts import redirect
-            return redirect(inv.pdf_url)
-        else:
-            # production: return JSON with a note (or implement presigned URL logic)
-            return Response({'detail': 'ok', 'invoice_id': inv.id, 'pdf_url': inv.pdf_url})
+    def post(self, request):
+        if not request.user.is_staff:
+            return Response({'error': 'sin permiso'}, status=status.HTTP_403_FORBIDDEN)
+        serializer = PayrollSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        payroll = Payroll.objects.create(name=data['name'], period_start=data['period_start'], period_end=data['period_end'], total_amount=int(data.get('total_amount',0)), created_by=request.user)
+        return Response({'id': payroll.id}, status=status.HTTP_201_CREATED)
+    
+    # webhook handler implemetado en apps.finanzas.webhook

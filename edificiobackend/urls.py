@@ -15,9 +15,11 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.urls import path, include
+from django.urls import include, path, re_path
 from django.conf import settings
 from django.conf.urls.static import static
+
+from apps.finanzas.webhook import stripe_webhook
 
 
 urlpatterns = [
@@ -25,7 +27,31 @@ urlpatterns = [
     path("api/usuarios/", include("apps.usuarios.urls")),
     path("api/gestion-usuarios/", include("apps.gestion_usuarios.urls")),
     path("api/finanzas/", include("apps.finanzas.urls")),
+    path('webhook/stripe/', stripe_webhook, name='stripe-webhook'),
 ]
 
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+
+# Optional API docs (drf_yasg). Add routes only if drf_yasg is available.
+try:
+    from drf_yasg.views import get_schema_view
+    from drf_yasg import openapi
+    from rest_framework import permissions
+    schema_view = get_schema_view(
+        openapi.Info(
+            title="API de Pagos",
+            default_version='v1',
+            description="API para procesar pagos con Stripe",
+        ),
+        public=True,
+        permission_classes=(permissions.AllowAny,)
+    )
+    urlpatterns += [
+        re_path(r'^docs(?P<format>\.json|\.yaml)$', schema_view.without_ui(cache_timeout=0), name='schema-json'),
+        path('docs/', schema_view.with_ui('swagger', cache_timeout=0), name='schema-swagger-ui'),
+    ]
+except Exception:
+    # drf_yasg no instalado: ignorar
+    pass
