@@ -14,6 +14,10 @@ from pathlib import Path
 from datetime import timedelta
 import base64
 import os
+from dotenv import load_dotenv
+
+# Cargar .env si existe (variables sensibles)
+load_dotenv(BASE_DIR := Path(__file__).resolve().parent.parent / '.env')
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -26,9 +30,13 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-sb-&l2*xlxbr3ta&*)_3i3y3!=(26hp7%z=xa-%^hcc*#5d2pe'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get('DEBUG', 'True').lower() in ('1', 'true', 'yes')
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    'localhost',
+    '127.0.0.1',
+    'testserver',
+]
 
 
 # Application definition
@@ -46,12 +54,15 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt.token_blacklist',
     "corsheaders",  # opcional para frontend
     'apps.gestion_usuarios',
+    'apps.finanzas',
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
+    # Debug middleware to print response bodies when DEBUG=True
+    'edificiobackend.middleware.DebugResponseBodyMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
@@ -151,6 +162,14 @@ REST_FRAMEWORK = {
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ),
     'DEFAULT_FILTER_BACKENDS': ['django_filters.rest_framework.DjangoFilterBackend'],
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle'
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '30/min',
+        'user': '60/min',
+    },
 }
 
 CORS_ALLOW_ALL_ORIGINS = True
@@ -159,18 +178,39 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:4200",
 ]
 
-# Configuración de correo para envío de emails de verificación y recuperación
-# Para desarrollo - mostrar emails en consola (comentado temporalmente)
-# EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+# Allow Authorization header and credentials for SPA
+CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_HEADERS = list(
+    os.environ.get('CORS_ALLOW_HEADERS', 'authorization,content-type').split(',')
+)
 
-# Para producción - envío real por SMTP
-EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = 'smtp.gmail.com'  # Cambia por el servidor SMTP de tu proveedor (ejemplo: Gmail)
-EMAIL_PORT = 587
-EMAIL_HOST_USER = 'innovabuilding01@gmail.com'  # Aquí va TU correo (el que enviará los mensajes)
-EMAIL_HOST_PASSWORD = 'tlfv jnlw fyax llmu'  # Contraseña de aplicación (generada por google) o del correo
-EMAIL_USE_TLS = True
-DEFAULT_FROM_EMAIL = 'noreply@edificioapp.com'  # El remitente que verán los usuarios en su bandeja
+# Configuración de correo para envío de emails de verificación y recuperación
+# En desarrollo usamos el backend de consola para evitar dependencias SMTP y
+# que el envío de correos bloquee o falle tests/local dev. En producción se
+# debe configurar la variable EMAIL_BACKEND en el entorno.
+# Read email configuration from environment. Respect whatever is provided in
+# the .env file so you can run SMTP in development if desired. Values are
+# normalized (booleans/ints) and we strip accidental spaces inside passwords
+# which commonly appear when copying app-passwords grouped for readability.
+EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
+
+EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
+try:
+    EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
+except ValueError:
+    EMAIL_PORT = 587
+
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+# Remove spaces that may have been inserted when copying an App Password
+raw_email_password = os.environ.get('EMAIL_HOST_PASSWORD', '')
+EMAIL_HOST_PASSWORD = raw_email_password.replace(' ', '')
+
+EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True').lower() in ('1', 'true', 'yes')
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@edificioapp.com')
+
+# Stripe keys (from .env)
+STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),  # Token expira en 15 minutos
@@ -185,8 +225,16 @@ AUTH_USER_MODEL = 'usuarios.Usuario'
 SECURE_BROWSER_XSS_FILTER = True
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = 'DENY'
-CSRF_COOKIE_SECURE = True
-SESSION_COOKIE_SECURE = True
+# Durante desarrollo local (DEBUG=True) evitamos marcar las cookies "secure"
+# y otras cabeceras que pueden impedir que herramientas locales (stripe cli,
+# ngrok, postman) hagan POSTs a localhost sin HTTPS. En producción DEBUG=False
+# las dejamos activas.
+if DEBUG:
+    CSRF_COOKIE_SECURE = False
+    SESSION_COOKIE_SECURE = False
+else:
+    CSRF_COOKIE_SECURE = True
+    SESSION_COOKIE_SECURE = True
 
 # Django usa esto por defecto para hashear contraseñas
 PASSWORD_HASHERS = [
@@ -198,3 +246,11 @@ PASSWORD_HASHERS = [
 # Valor por defecto para el rol asignado a nuevos registros de usuario.
 # Debe coincidir con una de las opciones de `Role.choices` (ej. 'residente', 'personal', 'junta', 'admin')
 DEFAULT_REGISTER_ROLE = 'residente'
+
+# Media files for generated invoices/PDFs
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+# Limits (amounts in cents)
+MAX_MANUAL_PAYMENT_AMOUNT = int(os.environ.get('MAX_MANUAL_PAYMENT_AMOUNT', 10000000))  # default 100,000.00
+MAX_OVERDUE_CHARGE_AMOUNT = int(os.environ.get('MAX_OVERDUE_CHARGE_AMOUNT', 5000000))  # default 50,000.00

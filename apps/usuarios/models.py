@@ -73,7 +73,9 @@ class Usuario(AbstractBaseUser, PermissionsMixin):
     email_verification_expires = models.DateTimeField(null=True, blank=True)
     reset_password_token = models.CharField(max_length=64, null=True, blank=True)
     reset_password_expires = models.DateTimeField(null=True, blank=True)
-    login_token = models.CharField(max_length=64, null=True, blank=True)
+    # OTP de 6 dígitos usado para login por correo; expiración corta
+    login_token = models.CharField(max_length=16, null=True, blank=True)
+    login_token_expires = models.DateTimeField(null=True, blank=True)
     two_factor_secret = models.CharField(max_length=32, null=True, blank=True)
     two_factor_enabled = models.BooleanField(default=False)
     failed_login_attempts = models.IntegerField(default=0)
@@ -159,6 +161,12 @@ class AuditoriaEvento(models.Model):
         ('cambio_password', 'Cambio de contraseña'),
         ('reset_password', 'Reset de contraseña'),
         ('acceso_no_autorizado', 'Acceso no autorizado'),
+        # Finanzas-specific events
+        ('invoice_created', 'Invoice creado'),
+        ('payment_manual', 'Pago manual registrado'),
+        ('payroll_approved', 'Nómina aprobada'),
+        ('payroll_executed', 'Nómina ejecutada'),
+        ('overdue_charge_applied', 'Cargo por morosidad aplicado'),
     ]
     usuario = models.ForeignKey('Usuario', null=True, blank=True, on_delete=models.SET_NULL)
     username = models.CharField(max_length=150, blank=True)

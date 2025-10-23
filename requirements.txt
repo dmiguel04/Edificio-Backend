@@ -9,3 +9,6 @@ psycopg2-binary
 bleach
 django-cors-headers
 pycryptodome
+stripe
+python-dotenv
+reportlab

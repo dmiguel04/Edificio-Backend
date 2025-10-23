@@ -4,6 +4,8 @@ from .views import (
     ForgotPasswordAPIView, ResetPasswordAPIView, ChangePasswordAPIView, ValidateLoginTokenAPIView, AuditoriaEventoListAPIView,
     LogoutAPIView, LogoutAllSessionsAPIView, Activate2FAAPIView, Verify2FAAPIView, UsuarioRawAPIView,
     AccountStatusAPIView, VerificarEmailAPIView, ReenviarVerificacionAPIView
+    , MeAPIView
+    , UsersRootAPIView
 )
 
 urlpatterns = [
@@ -20,6 +22,15 @@ urlpatterns = [
     path('2fa/activate/', Activate2FAAPIView.as_view(), name='activate-2fa'),
     path('2fa/verify/', Verify2FAAPIView.as_view(), name='verify-2fa'),
     path('raw/', UsuarioRawAPIView.as_view(), name='usuario-raw'),  # <-- CORRECTO
+    path('me/', MeAPIView.as_view(), name='usuario-me'),
+        path('', UsersRootAPIView.as_view(), name='usuarios-root'),
+    # Alias para compatibilidad con frontend antiguo: permite POST /api/usuarios/<pk>/assign-role/
+    path('<int:pk>/assign-role/',
+         # import aquí para evitar ciclos al importar gestion_usuarios.urls
+         # la view está definida en apps.usuarios.views
+         # y reutiliza el serializer y permisos de gestion_usuarios
+         __import__('apps.usuarios.views', fromlist=['AssignRoleAliasAPIView']).AssignRoleAliasAPIView.as_view(),
+         name='assign-role-alias'),
     path('account-status/', AccountStatusAPIView.as_view(), name='account-status'),
     # === NUEVOS ENDPOINTS PARA VERIFICACIÓN DE EMAIL ===
     path('verificar-email/', VerificarEmailAPIView.as_view(), name='verificar-email'),

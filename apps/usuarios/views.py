@@ -33,6 +33,58 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Alias endpoint helper: allow legacy frontend to POST /api/usuarios/<pk>/assign-role/
+from rest_framework.decorators import permission_classes
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated as DRFIsAuthenticated
+from apps.gestion_usuarios.permissions import IsAdministrador as IsAdministradorPermission
+from apps.gestion_usuarios.serializers import AsignarRolSerializer as GestionAsignarRolSerializer
+from apps.usuarios.models import Role as UsuarioRole
+from django.shortcuts import get_object_or_404
+from django.db import transaction
+
+
+class MeAPIView(APIView):
+    """Retorna los datos del usuario autenticado."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        # Devolver un perfil mínimo y el rol para que el frontend pueda usarlo
+        data = {
+            'id': user.id,
+            'username': getattr(user, 'username', None),
+            'email': getattr(user, 'email', None),
+            'rol': getattr(user, 'rol', None),
+            'is_staff': user.is_staff,
+        }
+        return Response(data)
+
+
+class UsersRootAPIView(APIView):
+    """Simple API root for the usuarios app.
+
+    Returns a JSON object with the main endpoints so GET /api/usuarios/ is not 404.
+    This is purely for developer/UX convenience and can be removed later.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        base = request.build_absolute_uri('/api/usuarios/')
+        return Response({
+            'endpoints': {
+                'register': base + 'register/',
+                'login': base + 'login/',
+                'validate_login_token': base + 'validate-login-token/',
+                '2fa_verify': base + '2fa/verify/',
+                '2fa_activate': base + '2fa/activate/',
+                'forgot_password': base + 'forgot-password/',
+                'reset_password': base + 'reset-password/',
+                'me': base + 'me/',
+            },
+            'note': 'This is an index for the usuarios API. Use the specific endpoints for actions.'
+        })
+
 
 def get_client_ip(request):
     x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
@@ -88,15 +140,63 @@ class Verify2FAAPIView(APIView):
             if totp.verify(code):
                 user.two_factor_enabled = True
                 user.save()
+                # Generar tokens e incluir claim 'role'
                 refresh = RefreshToken.for_user(user)
+                try:
+                    role_val = getattr(user, 'rol', None)
+                    if role_val is not None:
+                        refresh['role'] = str(role_val)
+                        refresh.access_token['role'] = str(role_val)
+                except Exception:
+                    pass
+
+                access_token = str(refresh.access_token)
+                refresh_token = str(refresh)
+
                 return Response({
                     "msg": "2FA verificado correctamente.",
-                    "access": str(refresh.access_token),
-                    "refresh": str(refresh),
+                    "message": "2FA verificado correctamente.",
+                    "detail": "2FA verificado correctamente.",
+                    # principales claves usadas por cliente
+                    "access": access_token,
+                    "refresh": refresh_token,
+                    # variantes esperadas
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
                 })
             return Response({"error": "Código inválido."}, status=400)
         except Usuario.DoesNotExist:
             return Response({"error": "Usuario no encontrado."}, status=400)
+
+
+class AssignRoleAliasAPIView(APIView):
+    """Alias para mantener compatibilidad con frontend antiguo.
+
+    POST /api/usuarios/<pk>/assign-role/ -> reasigna rol (solo admin)
+    """
+    permission_classes = [DRFIsAuthenticated, IsAdministradorPermission]
+
+    def post(self, request, pk=None):
+        UsuarioModel = Usuario
+        usuario = get_object_or_404(UsuarioModel, pk=pk)
+        serializer = GestionAsignarRolSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        nuevo_rol = serializer.validated_data['rol']
+        if nuevo_rol not in [c[0] for c in UsuarioRole.choices]:
+            return Response({'detail': 'Rol inválido'}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            old = usuario.rol
+            usuario.rol = nuevo_rol
+            usuario.save()
+        # Notificar por correo al usuario sobre el cambio de rol (fuera de transacción)
+        try:
+            subject = 'Cambio de rol - EdificioApp'
+            message = f"Hola {usuario.persona.nombre},\n\nTu rol en EdificioApp ha sido actualizado de '{old}' a '{nuevo_rol}'.\n\nSi crees que esto es un error, contacta con el administrador.\n\nSaludos,\nEl equipo de EdificioApp"
+            send_email(subject, message, [usuario.email], fail_silently=True)
+        except Exception:
+            logger.exception('Error enviando correo de notificación de rol a %s', usuario.email)
+
+        return Response({'status': 'rol asignado'})
 
 class RegisterAPIView(APIView):
     permission_classes = [AllowAny]
@@ -156,32 +256,77 @@ class LoginAPIView(APIView):
             usuario = serializer.validated_data["usuario"]
             # Si el usuario debe cambiar la contraseña (creado por admin), bloquear login normal
             if getattr(usuario, 'must_change_password', False):
-                return Response({"error": "must_change_password", "message": "Debe establecer una contraseña usando el flujo de restablecimiento."}, status=403)
+                return Response({
+                    "error": "must_change_password",
+                    "message": "Debe establecer una contraseña usando el flujo de restablecimiento.",
+                    "msg": "Debe establecer una contraseña usando el flujo de restablecimiento.",
+                    "detail": "Debe establecer una contraseña usando el flujo de restablecimiento.",
+                }, status=403)
 
+            # Reset counters
             usuario.failed_login_attempts = 0
             usuario.account_locked_until = None
-            usuario.login_token = str(uuid.uuid4())
+            # Generar OTP de 6 dígitos para flujo de verificación en dos pasos
+            import random
+            otp = f"{random.randint(0, 999999):06d}"
+            usuario.login_token = otp
+            usuario.login_token_expires = timezone.now() + timedelta(minutes=10)
             usuario.save()
 
-            # Enviar token por email (wrapper)
-            send_email(
-                subject="Token de acceso - EdificioApp",
-                message=f"Tu token de acceso es: {usuario.login_token}",
-                recipient_list=[usuario.email],
-            )
+            # Enviar token por correo (no devolver tokens aquí para forzar validación)
+            try:
+                send_email(
+                    subject="Código de acceso - EdificioApp",
+                    message=f"Tu código de acceso temporal es: {otp}\nSi no solicitaste este inicio de sesión, ignora este correo.",
+                    recipient_list=[usuario.email],
+                )
+            except Exception:
+                # No exponer fallo de envío al cliente (evitar enumeración)
+                logger.exception('Error sending login token to %s', usuario.email)
 
+            # Registrar evento de inicio de login (token enviado)
             AuditoriaEvento.objects.create(
                 usuario=usuario,
                 username=usuario.username,
-                evento='login_exitoso',
+                evento='login_iniciado',
                 ip=ip,
                 user_agent=user_agent,
-                detalle='Login correcto',
+                detalle='Login iniciado: token enviado por email',
             )
-            return Response({"msg": "Se ha enviado un token de acceso a tu correo.", "username": usuario.username})
 
-        # Manejo de errores: evitar elevar excepciones no gestionadas
+            # Indicar al cliente que debe validar el token recibido.
+            # Incluir variantes de claves para que clientes tolerantes manejen distintas respuestas.
+            # Incluir 'sent_to' enmascarado para mejor UX inmediato
+            sent_to = None
+            try:
+                e = usuario.email or ''
+                if '@' in e:
+                    local, domain = e.split('@', 1)
+                    if len(local) <= 2:
+                        masked_local = local[0] + '*' * (len(local)-1)
+                    else:
+                        masked_local = local[:2] + '*' * (len(local)-2)
+                    sent_to = f"{masked_local}@{domain}"
+                else:
+                    sent_to = e
+            except Exception:
+                sent_to = None
+
+            payload = {
+                "require_token": True,
+                "requires_token": True,
+                "token_required": True,
+                "message": "Se envió un token a tu correo para continuar con el inicio de sesión.",
+                "msg": "Se envió un token a tu correo para continuar con el inicio de sesión.",
+                "detail": "Se envió un token a tu correo para continuar con el inicio de sesión.",
+                "sent_to": sent_to,
+            }
+
+            return Response(payload)
+
+        # Manejo de errores de login: normalizar respuesta JSON
         errors = serializer.errors
+        # email_not_verified special case kept
         if usuario and isinstance(errors, dict) and 'email_not_verified' in str(errors):
             AuditoriaEvento.objects.create(
                 usuario=usuario,
@@ -191,15 +336,15 @@ class LoginAPIView(APIView):
                 user_agent=user_agent,
                 detalle='Login fallido: Email no verificado',
             )
-            return Response(
-                {
-                    "error": "email_not_verified",
-                    "message": "Debes verificar tu correo electrónico antes de iniciar sesión",
-                    "email": usuario.email,
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({
+                "error": "email_not_verified",
+                "message": "Debes verificar tu correo electrónico antes de iniciar sesión",
+                "msg": "Debes verificar tu correo electrónico antes de iniciar sesión",
+                "detail": "Debes verificar tu correo electrónico antes de iniciar sesión",
+                "email": usuario.email,
+            }, status=status.HTTP_400_BAD_REQUEST)
 
+        # contador de intentos fallidos
         if usuario:
             usuario.failed_login_attempts += 1
             if usuario.failed_login_attempts >= 5:
@@ -214,7 +359,24 @@ class LoginAPIView(APIView):
             user_agent=user_agent,
             detalle=str(errors),
         )
-        return Response(errors, status=status.HTTP_400_BAD_REQUEST)
+
+        # Normalizar errores: si es dict, devolver primer mensaje legible
+        message = None
+        if isinstance(errors, dict):
+            # buscar claves y tomar primer valor
+            for k, v in errors.items():
+                try:
+                    if isinstance(v, (list, tuple)) and v:
+                        message = str(v[0])
+                    else:
+                        message = str(v)
+                except Exception:
+                    message = str(v)
+                break
+        else:
+            message = str(errors)
+
+        return Response({"error": "invalid_credentials", "message": message, "msg": message, "detail": message}, status=status.HTTP_400_BAD_REQUEST)
 
 class ForgotPasswordAPIView(APIView):
     def post(self, request):
@@ -307,35 +469,103 @@ class ChangePasswordAPIView(APIView):
 
 class ValidateLoginTokenAPIView(APIView):
     def post(self, request):
-        username = request.data.get('username')
-        token = request.data.get('token')
-        if not username or not token:
-            return Response({"error": "Username y token requeridos."}, status=400)
-        try:
-            usuario = Usuario.objects.get(username=username)
-            if usuario.login_token != token:
-                return Response({"error": "Token inválido."}, status=400)
+        # Aceptar variantes de campo para username y token
+        username = request.data.get('username') or request.data.get('user') or request.data.get('email')
+        token = request.data.get('token') or request.data.get('code') or request.data.get('login_token') or request.data.get('email_token')
 
+        if not username or not token:
+            return Response({"error": "username y token requeridos.", "message": "username y token requeridos.", "msg": "username y token requeridos.", "detail": "username y token requeridos."}, status=400)
+
+        try:
+            # Buscar por username o email
+            try:
+                usuario = Usuario.objects.get(username=username)
+            except Usuario.DoesNotExist:
+                usuario = Usuario.objects.filter(email=username).first()
+            if not usuario:
+                return Response({"error": "Usuario no encontrado.", "message": "Usuario no encontrado.", "detail": "Usuario no encontrado."}, status=400)
+
+            # Comparar token
+            if not usuario.login_token or usuario.login_token != token:
+                # Incrementar contador de intentos fallidos para el usuario
+                try:
+                    usuario.failed_login_attempts = (usuario.failed_login_attempts or 0) + 1
+                    if usuario.failed_login_attempts >= 5:
+                        usuario.account_locked_until = timezone.now() + timedelta(minutes=1)
+                    usuario.save()
+                except Exception:
+                    pass
+
+                return Response({"error": "Token inválido.", "message": "Token inválido.", "detail": "Token inválido."}, status=400)
+
+            # Token válido: limpiar
             usuario.login_token = None
             usuario.save()
 
-            # Si no tiene 2FA activado, generar QR/base64 para activar
+            # Si no tiene 2FA activado, emitir tokens JWT directamente
             if not usuario.two_factor_enabled:
-                if not usuario.two_factor_secret:
-                    usuario.two_factor_secret = pyotp.random_base32()
-                    usuario.save()
-                otp_uri = pyotp.totp.TOTP(usuario.two_factor_secret).provisioning_uri(
-                    name=usuario.email, issuer_name="EdificioApp"
-                )
-                img = qrcode.make(otp_uri)
-                buf = io.BytesIO()
-                img.save(buf, format='PNG')
-                img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-                qr_url = f"data:image/png;base64,{img_base64}"
-                return Response({"qr_url": qr_url})
+                try:
+                    refresh = RefreshToken.for_user(usuario)
+                    try:
+                        role_val = getattr(usuario, 'rol', None)
+                        if role_val is not None:
+                            refresh['role'] = str(role_val)
+                            refresh.access_token['role'] = str(role_val)
+                    except Exception:
+                        pass
+                    access_token = str(refresh.access_token)
+                    refresh_token = str(refresh)
+
+                    AuditoriaEvento.objects.create(
+                        usuario=usuario,
+                        username=usuario.username,
+                        evento='login_exitoso',
+                        ip=get_client_ip(request),
+                        user_agent=request.META.get('HTTP_USER_AGENT', ''),
+                        detalle='Login correcto via token',
+                    )
+
+                    # Devolver tokens con variantes para clientes tolerantes
+                    # Incluir información útil para el cliente: a qué email fue enviado (enmascarado)
+                    sent_to = None
+                    try:
+                        e = usuario.email or ''
+                        if '@' in e:
+                            local, domain = e.split('@', 1)
+                            if len(local) <= 2:
+                                masked_local = local[0] + '*' * (len(local)-1)
+                            else:
+                                masked_local = local[:2] + '*' * (len(local)-2)
+                            sent_to = f"{masked_local}@{domain}"
+                        else:
+                            sent_to = e
+                    except Exception:
+                        sent_to = None
+
+                    return Response({
+                        "access": access_token,
+                        "refresh": refresh_token,
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "message": "Login correcto.",
+                        "msg": "Login correcto.",
+                        "detail": "Login correcto.",
+                        "sent_to": sent_to,
+                    })
+                except Exception as e:
+                    logger.exception('Error issuing JWT after token validation for %s: %s', usuario.username, e)
+                    return Response({"error": "token_issue_failed"}, status=500)
 
             # Si ya tiene 2FA activado, indicar que se requiere código 2FA
-            return Response({"require_2fa": True})
+            payload_2fa = {
+                "require_2fa": True,
+                "requires_2fa": True,
+                "two_factor_enabled": True,
+                "message": "Se requiere código 2FA para completar el login.",
+                "msg": "Se requiere código 2FA para completar el login.",
+                "detail": "Se requiere código 2FA para completar el login.",
+            }
+            return Response(payload_2fa)
         except Usuario.DoesNotExist:
             return Response({"error": "Usuario no encontrado."}, status=400)
 
